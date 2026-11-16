@@ -301,6 +301,7 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 		d.out = errorOutcome("engine returned no result")
 	}
 	d.checks = append(d.checks, d.out.Checks...)
+	return
 }
 
 func errorOutcome(reason string) engine.Outcome {

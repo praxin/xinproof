@@ -18,7 +18,7 @@ func TestCanonicalize(t *testing.T) {
 		{
 			// RFC 8785 §3.2.2 example.
 			name: "rfc8785 example",
-			in:   `{"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],"string":"€$\u000F\u000aA'B"\\\\"\/","literals":[null,true,false]}`,
+			in:   `{"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],"string":"\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/","literals":[null,true,false]}`,
 			want: `{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\\\"/"}`,
 		},
 		{name: "key order and whitespace", in: "{ \"b\" : 1, \"a\" : [ 1 , 2 ] }", want: `{"a":[1,2],"b":1}`},
@@ -26,7 +26,7 @@ func TestCanonicalize(t *testing.T) {
 		{name: "no html escaping", in: `{"s":"<a>&"}`, want: `{"s":"<a>&"}`},
 		{name: "negative zero", in: `[-0]`, want: `[0]`},
 		{name: "big integer", in: `[13314398208]`, want: `[13314398208]`},
-		{name: "utf16 key order", in: `{"€":1,"😀":2,"a":3}`, want: "{\"a\":3,\"\U0001F600\":2,\"€\":1}"},
+		{name: "utf16 key order", in: `{"\u20ac":1,"\ud83d\ude00":2,"a":3}`, want: "{\"a\":3,\"€\":1,\"😀\":2}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

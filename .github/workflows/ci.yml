@@ -20,13 +20,12 @@ jobs:
           go-version: stable
           cache: false
 
-      # Until go.sum is committed, resolve modules here and publish the result
-      # so it can be committed. Once committed, this must be a no-op.
-      - name: Resolve modules
+      # go.mod/go.sum must already be tidy; the tidied files are uploaded either
+      # way so a fix can be committed from machines that can't run Go.
+      - name: go mod tidy check
         run: |
           go mod tidy
-          git diff --stat -- go.mod go.sum || true
-          git status --short -- go.mod go.sum
+          git diff --exit-code -- go.mod go.sum
 
       - name: Upload go.mod / go.sum
         if: always()

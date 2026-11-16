@@ -126,18 +126,18 @@ func TestSniff(t *testing.T) {
 
 func TestIsCandidate(t *testing.T) {
 	tests := map[string]bool{
-		"pg_2026-11-14.dump":   true,
-		"nightly/shop.sql.gz":  true,
-		"shop.sql.zst":         true,
-		"db.backup":            true,
-		"DB.DUMP":              true,
-		"shop.pgdump.lz4":      true,
-		"notes.txt":            false,
-		"archive.tar.gz":       false,
-		"pg.dump.sha256":       false,
-		"receipts/HEAD":        false,
-		"image.png":            false,
-		"x.gz":                 false,
+		"pg_2026-11-14.dump":  true,
+		"nightly/shop.sql.gz": true,
+		"shop.sql.zst":        true,
+		"db.backup":           true,
+		"DB.DUMP":             true,
+		"shop.pgdump.lz4":     true,
+		"notes.txt":           false,
+		"archive.tar.gz":      false,
+		"pg.dump.sha256":      false,
+		"receipts/HEAD":       false,
+		"image.png":           false,
+		"x.gz":                false,
 	}
 	for name, want := range tests {
 		if got := IsCandidate(name); got != want {

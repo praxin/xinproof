@@ -109,11 +109,11 @@ func TestPlaceholderRoles(t *testing.T) {
 
 func TestParseIdents(t *testing.T) {
 	tests := map[string][]string{
-		`app`:                    {"app"},
-		`App, "Mixed Case"`:      {"app", "Mixed Case"},
-		`"a,b", c`:               {"a,b", "c"},
-		`"quote""inside"`:        {`quote"inside`},
-		`PUBLIC`:                 nil,
+		`app`:                        {"app"},
+		`App, "Mixed Case"`:          {"app", "Mixed Case"},
+		`"a,b", c`:                   {"a,b", "c"},
+		`"quote""inside"`:            {`quote"inside`},
+		`PUBLIC`:                     nil,
 		`GROUP admins, CURRENT_USER`: {"admins"},
 	}
 	for in, want := range tests {
