@@ -36,13 +36,13 @@ func TestS3Source(t *testing.T) {
 	now := time.Date(2026, 11, 16, 2, 0, 0, 0, time.UTC)
 	body := []byte("PGDMP pretend dump bytes")
 	objs := map[string]s3test.Object{
-		"postgres/pg_2026-11-14.dump":  {Body: body, LastModified: now, ChecksumSHA256: b64sha(body)},
-		"postgres/pg_2026-11-15.dump":  {Body: []byte("x"), LastModified: now, ChecksumSHA256: b64sha([]byte("x")) + "-3"}, // multipart: composite
-		"postgres/nested/pg.sql.gz":    {Body: []byte("y"), LastModified: now},
-		"postgres/":                    {Body: nil, LastModified: now}, // folder placeholder
-		"other/ignored.dump":           {Body: []byte("z"), LastModified: now},
-		"postgres/pg_2026-11-13.dump":  {Body: []byte("w"), LastModified: now},
-		"postgres/pg_2026-11-12.dump":  {Body: []byte("v"), LastModified: now},
+		"postgres/pg_2026-11-14.dump": {Body: body, LastModified: now, ChecksumSHA256: b64sha(body)},
+		"postgres/pg_2026-11-15.dump": {Body: []byte("x"), LastModified: now, ChecksumSHA256: b64sha([]byte("x")) + "-3"}, // multipart: composite
+		"postgres/nested/pg.sql.gz":   {Body: []byte("y"), LastModified: now},
+		"postgres/":                   {Body: nil, LastModified: now}, // folder placeholder
+		"other/ignored.dump":          {Body: []byte("z"), LastModified: now},
+		"postgres/pg_2026-11-13.dump": {Body: []byte("w"), LastModified: now},
+		"postgres/pg_2026-11-12.dump": {Body: []byte("v"), LastModified: now},
 	}
 	srv := s3test.New("acme", objs)
 	defer srv.Close()

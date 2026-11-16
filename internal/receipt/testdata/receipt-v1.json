@@ -1,0 +1,76 @@
+{
+  "schema": "xinproof.receipt/v1",
+  "id": "rcpt_01JD8Q4M7XK3V9Q2ZB6T5W1H0E",
+  "issued_at": "2026-11-16T14:21:07Z",
+  "subject": {
+    "source": "s3://acme-backups/postgres/pg_2026-11-16.dump",
+    "size": 13314398208,
+    "sha256": "9f2d4c1e7b0a5f3e8d6c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e",
+    "etag": "d41d8cd98f00b204e9800998ecf8427e-1588",
+    "last_modified": "2026-11-16T02:00:11Z",
+    "format": "postgres-custom"
+  },
+  "engine": {
+    "kind": "postgres",
+    "dump_version": "16.4",
+    "server_version": "16.4",
+    "sandbox_image": "postgres:16@sha256:4f1b6d3c2a1e0f9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d"
+  },
+  "result": "PASS",
+  "measured": {
+    "restore_seconds": 238.4,
+    "total_seconds": 291
+  },
+  "checks": [
+    {
+      "id": "l1.format",
+      "status": "pass",
+      "detail": "postgres-custom, dumped by version 16.4"
+    },
+    {
+      "id": "l1.sha256",
+      "status": "pass",
+      "detail": "sha256:9f2d… (13314398208 bytes)"
+    },
+    {
+      "id": "l2.toc",
+      "status": "pass",
+      "detail": "1093 TOC entries, 214 tables"
+    },
+    {
+      "id": "l2.restore",
+      "status": "pass",
+      "detail": "exit 0 in 238.4s"
+    },
+    {
+      "id": "l2.objects",
+      "status": "pass",
+      "detail": "214/214 tables"
+    },
+    {
+      "id": "l2.rows",
+      "status": "pass",
+      "detail": "38212904 rows (exact count)"
+    },
+    {
+      "id": "note",
+      "status": "info",
+      "detail": "unicode survives canonicalization: 信 \"quoted\" \u003ctag\u003e \u0026 é"
+    }
+  ],
+  "tool": {
+    "name": "xinproof",
+    "version": "0.1.0",
+    "commit": "0123456789ab"
+  },
+  "chain": {
+    "prev": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "seq": 1
+  },
+  "signature": {
+    "alg": "ed25519",
+    "key_id": "ed25519:56475aa75463474c",
+    "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "sig": "Q/CjNMYy1LY1KGifgqJ7OkDW33Y+22aufpyao2ev2SdmVqTPwKUAty/TQXfTPeO+bNt2K/Rvw2WKbiU5TYfIDQ=="
+  }
+}
