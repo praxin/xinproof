@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ type Options struct {
 	ToolVersion string
 	ToolCommit  string
 	Now         func() time.Time
+	Log         *slog.Logger // structured logs; nil discards
 
 	// OnPlan is called once the candidates are known; OnStart before and
 	// OnResult after each backup is processed.
@@ -67,6 +69,13 @@ type Verifier struct {
 
 // ErrNothingFound is returned when the location holds no backups at all.
 var ErrNothingFound = errors.New("no backups found")
+
+func (v *Verifier) log() *slog.Logger {
+	if v.Opts.Log != nil {
+		return v.Opts.Log
+	}
+	return slog.New(slog.DiscardHandler)
+}
 
 func (v *Verifier) now() time.Time {
 	if v.Opts.Now != nil {
@@ -126,24 +135,36 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 		v.Opts.OnPlan(plan)
 	}
 
+	v.log().Info("plan", "location", v.Src.String(), "found", plan.Found, "testing", plan.Testing, "skipped", plan.Skipped)
+
 	var results []Result
 	for _, o := range cands {
-		if v.Opts.OnStart != nil {
-			v.Opts.OnStart(o)
+		var r Result
+		if ctx.Err() != nil {
+			// Never silently partial: backups we didn't get to still end in ERROR, with a receipt.
+			r = v.notTested(o, "the run was interrupted before this backup was tested")
+		} else {
+			if v.Opts.OnStart != nil {
+				v.Opts.OnStart(o)
+			}
+			r = v.one(ctx, o, sidecars[o.Key])
 		}
-		r := v.one(ctx, o, sidecars[o.Key])
 		if err := v.issue(&r); err != nil {
 			return results, fmt.Errorf("writing receipt for %s: %w", o.Name, err)
 		}
+		v.log().Info("result", "backup", o.URL, "status", string(r.Status), "reason", r.Reason,
+			"tables", r.Tables, "rows", r.Rows, "restore_s", r.Restore.Seconds(), "total_s", r.Total.Seconds(), "receipt", r.ReceiptPath)
 		results = append(results, r)
 		if v.Opts.OnResult != nil {
 			v.Opts.OnResult(r)
 		}
-		if ctx.Err() != nil {
-			return results, ctx.Err()
-		}
 	}
-	return results, nil
+	return results, ctx.Err()
+}
+
+func (v *Verifier) notTested(o source.Object, reason string) Result {
+	d := &draft{obj: o, out: errorOutcome(reason)}
+	return Result{Object: o, Status: receipt.Error, Reason: reason, Receipt: v.build(d, 0)}
 }
 
 // draft collects what we learn about one backup.
@@ -163,6 +184,8 @@ func (d *draft) check(id, status, detail string) {
 func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string) (res Result) {
 	start := time.Now()
 	d := &draft{obj: obj}
+	lg := v.log().With("backup", obj.URL)
+	lg.Debug("start")
 	res.Object = obj
 	defer func() {
 		if p := recover(); p != nil { // never silent, even on a bug
@@ -203,6 +226,8 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 	// Discover: sniff the format from the first bytes.
 	det, srcErr := v.sniff(ctx, d.obj.Key)
 	d.det = det
+	lg.Debug("detected", "format", string(det.Format), "compression", string(det.Compression),
+		"dump_version", det.DumpVersion, "problem", det.Problem)
 	if srcErr != nil {
 		d.out = errorOutcome(budget(srcErr, "reading object"))
 		return
@@ -247,6 +272,8 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 		return
 	}
 	d.sha = l1.sha256
+	lg.Debug("l1 streamed", "sha256", l1.sha256, "bytes", l1.size, "uncompressed", l1.inner,
+		"corrupt", errString(l1.corruptErr), "sink", errString(firstErr(l1.sinkErr, uploadErr)))
 	d.check("l1.sha256", receipt.CheckPass, fmt.Sprintf("sha256:%s (%d bytes)", l1.sha256, l1.size))
 	if l1.corruptErr != nil {
 		reason := fmt.Sprintf("%s stream ends early or is corrupt at byte %d of %d: %v", det.Compression, l1.size, d.obj.Size, l1.corruptErr)
@@ -310,6 +337,13 @@ func errorOutcome(reason string) engine.Outcome {
 
 func failOutcome(reason string) engine.Outcome {
 	return engine.Outcome{Result: receipt.Fail, Reason: reason}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func firstErr(errs ...error) error {

@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -129,6 +130,10 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	pathStyle := fs.Bool("path-style", false, "use path-style S3 addressing (MinIO and most self-hosted stores)")
 	r2Account := fs.String("r2-account-id", "", "Cloudflare account ID for r2:// (or R2_ACCOUNT_ID)")
 	noColor := fs.Bool("no-color", false, "disable colored output (NO_COLOR is honored too)")
+	format := fs.String("format", "human", "report format: human, json or junit")
+	output := fs.String("output", "", "write the json/junit report to this file (human output stays on stdout)")
+	logLevel := fs.String("log-level", "warn", "structured log level on stderr: debug, info, warn, error, off")
+	logFormat := fs.String("log-format", "text", "structured log format: text or json")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: xinproof verify [flags] <location>")
 		fs.PrintDefaults()
@@ -153,6 +158,49 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return exitUsage
 	}
+	if *format != "human" && *format != "json" && *format != "junit" {
+		fmt.Fprintf(stderr, "unknown --format %q (human, json or junit)\n", *format)
+		return exitUsage
+	}
+	logger, err := newLogger(stderr, *logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitUsage
+	}
+	// Human progress goes to stdout unless stdout carries the machine report.
+	humanOut, reportOut := stdout, io.Writer(nil)
+	if *format != "human" {
+		if *output == "" {
+			humanOut, reportOut = stderr, stdout
+		} else {
+			f, err := os.Create(*output)
+			if err != nil {
+				fmt.Fprintln(stderr, "xinproof:", err)
+				return exitUsage
+			}
+			defer f.Close()
+			reportOut = f
+		}
+	}
+	started := time.Now()
+	writeReport := func(results []verify.Result, code int, runErr error) int {
+		if reportOut == nil {
+			return code
+		}
+		run := report.Run{Tool: receipt.Tool{Name: "xinproof", Version: version, Commit: commit()}, Location: pos[0],
+			StartedAt: started, Results: results, ExitCode: code, Err: runErr}
+		var werr error
+		if *format == "json" {
+			werr = report.WriteJSON(reportOut, run)
+		} else {
+			werr = report.WriteJUnit(reportOut, run)
+		}
+		if werr != nil {
+			fmt.Fprintln(stderr, "xinproof: writing report:", werr)
+			return exitError
+		}
+		return code
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -160,30 +208,30 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	src, code, err := openSource(ctx, pos[0], s3src.Options{Endpoint: *endpoint, Region: *region, Profile: *profile, PathStyle: *pathStyle}, *r2Account)
 	if err != nil {
 		fmt.Fprintln(stderr, "xinproof:", err)
-		return code
+		return writeReport(nil, code, err)
 	}
 
 	keysDir := filepath.Join(home(), "keys")
 	priv, created, err := receipt.LoadOrCreateKey(keysDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "xinproof: signing key:", err)
-		return exitError
+		return writeReport(nil, exitError, fmt.Errorf("signing key: %w", err))
 	}
 
 	tty := false
-	if f, ok := stdout.(*os.File); ok {
+	if f, ok := humanOut.(*os.File); ok {
 		tty = report.IsTerminal(f)
 	}
 	_, noColorEnv := os.LookupEnv("NO_COLOR")
-	h := &report.Human{W: stdout, Color: tty && !*noColor && !noColorEnv, TTY: tty}
+	h := &report.Human{W: humanOut, Color: tty && !*noColor && !noColorEnv, TTY: tty}
 	if created {
-		fmt.Fprintf(stdout, "  new signing key %s created in %s\n", receipt.KeyID(priv.Public().(ed25519.PublicKey)), keysDir)
+		fmt.Fprintf(humanOut, "  new signing key %s created in %s\n", receipt.KeyID(priv.Public().(ed25519.PublicKey)), keysDir)
 	}
 
-	docker := &sandbox.Docker{Bin: *dockerBin}
+	docker := &sandbox.Docker{Bin: *dockerBin, Log: logger}
 	if docker.Available(ctx) == nil {
 		if n, _ := docker.Reap(ctx); n > 0 {
-			fmt.Fprintf(stdout, "  removed %d expired sandbox container(s) from an earlier run\n", n)
+			fmt.Fprintf(humanOut, "  removed %d expired sandbox container(s) from an earlier run\n", n)
 		}
 	}
 	eng := &postgres.Engine{
@@ -209,19 +257,55 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 			OnPlan:      h.Plan,
 			OnStart:     func(o source.Object) { h.Start(o.Name) },
 			OnResult:    h.Result,
+			Log:         logger,
 		},
 	}
 	results, err := v.Run(ctx)
 	if errors.Is(err, verify.ErrNothingFound) {
-		fmt.Fprintf(stdout, "  ! no backups found at %s (looked for .dump .sql .backup .bak …, optionally .gz/.zst/.lz4)\n", src)
-		return exitError
+		fmt.Fprintf(humanOut, "  ! no backups found at %s (looked for .dump .sql .backup .bak …, optionally .gz/.zst/.lz4)\n", src)
+		return writeReport(nil, exitError, err)
 	}
 	h.Footer(results, *receiptsDir)
-	if err != nil {
+	switch {
+	case errors.Is(err, context.Canceled):
+		// Every backup still has a result (untested ones are ERROR), so exit by results.
+		fmt.Fprintln(stderr, "xinproof: interrupted; backups not reached are reported as ERROR")
+		code := verify.ExitCode(results)
+		if code == exitPass {
+			code = exitError
+		}
+		return writeReport(results, code, err)
+	case err != nil:
 		fmt.Fprintln(stderr, "xinproof:", err)
-		return exitError
+		return writeReport(results, exitError, err)
 	}
-	return verify.ExitCode(results)
+	return writeReport(results, verify.ExitCode(results), nil)
+}
+
+func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
+	var lv slog.Level
+	switch level {
+	case "off", "none":
+		return slog.New(slog.DiscardHandler), nil
+	case "debug":
+		lv = slog.LevelDebug
+	case "info":
+		lv = slog.LevelInfo
+	case "warn", "warning":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	default:
+		return nil, fmt.Errorf("unknown --log-level %q", level)
+	}
+	opts := &slog.HandlerOptions{Level: lv}
+	switch format {
+	case "text":
+		return slog.New(slog.NewTextHandler(w, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(w, opts)), nil
+	}
+	return nil, fmt.Errorf("unknown --log-format %q (text or json)", format)
 }
 
 func openSource(ctx context.Context, loc string, o s3src.Options, r2Account string) (source.Source, int, error) {

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -26,7 +27,15 @@ const (
 )
 
 type Docker struct {
-	Bin string // docker binary; "docker" if empty
+	Bin string       // docker binary; "docker" if empty
+	Log *slog.Logger // nil discards
+}
+
+func (d *Docker) log() *slog.Logger {
+	if d.Log != nil {
+		return d.Log
+	}
+	return slog.New(slog.DiscardHandler)
 }
 
 func (d *Docker) bin() string {
@@ -57,6 +66,7 @@ func (d *Docker) Available(ctx context.Context) error {
 // returns its repo digest ("postgres@sha256:…") when known.
 func (d *Docker) EnsureImage(ctx context.Context, image string) (string, error) {
 	if _, err := d.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}", image); err != nil {
+		d.log().Info("pulling sandbox image", "image", image)
 		if out, err := d.run(ctx, nil, "pull", "--quiet", image); err != nil {
 			return "", fmt.Errorf("cannot pull sandbox image %s: %s", image, firstLine(out, err))
 		}
@@ -129,7 +139,9 @@ func (d *Docker) Run(ctx context.Context, s Spec) (*Container, error) {
 		env = append(env, kv)
 	}
 	args = append(args, s.Image)
+	d.log().Debug("sandbox start", "container", s.Name, "image", s.Image, "memory", s.Memory, "cpus", s.CPUs, "tmpfs", s.TmpfsSize)
 	if out, err := d.run(ctx, env, args...); err != nil {
+		d.log().Warn("sandbox start failed", "container", s.Name, "error", firstLine(out, err))
 		return c, fmt.Errorf("cannot start sandbox container: %s", firstLine(out, err))
 	}
 	return c, nil
@@ -214,8 +226,10 @@ func (c *Container) Remove() error {
 	defer cancel()
 	out, err := c.d.run(ctx, nil, "rm", "-f", "-v", c.Name)
 	if err != nil && !strings.Contains(string(out), "No such container") {
+		c.d.log().Error("sandbox removal failed; the reaper will retry on the next run", "container", c.Name, "error", firstLine(out, err))
 		return fmt.Errorf("removing sandbox %s: %s", c.Name, firstLine(out, err))
 	}
+	c.d.log().Debug("sandbox removed", "container", c.Name)
 	return nil
 }
 
@@ -239,6 +253,7 @@ func (d *Docker) Reap(ctx context.Context) (int, error) {
 			continue
 		}
 		if (&Container{d: d, Name: name}).Remove() == nil {
+			d.log().Info("reaped expired sandbox", "container", name)
 			n++
 		}
 	}

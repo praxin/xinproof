@@ -70,12 +70,18 @@ Least privilege for S3: `s3:ListBucket` on the bucket (prefix) and `s3:GetObject
 | `--tmpfs SIZE` | off | keep the dump and restored data in RAM instead of the container's disk |
 | `--pg-image` | `postgres:<major>` | override the sandbox image |
 | `--endpoint`, `--region`, `--profile`, `--path-style`, `--r2-account-id` | | storage options |
+| `--format` | `human` | `json` (schema `xinproof.report/v1`) or `junit` for CI; the report goes to stdout and human progress to stderr |
+| `--output FILE` | | write the json/junit report to a file and keep human output on stdout |
+| `--log-level`, `--log-format` | `warn`, `text` | structured logs on stderr (`debug`/`info`/`warn`/`error`/`off`; `text` or `json`) |
 | `--no-color` | | also honors `NO_COLOR` |
+
+Interrupting a run (Ctrl-C, SIGTERM) stops the current restore, removes its sandbox, and reports every backup not yet tested as ERROR, each with a receipt.
 
 ### Exit codes
 `0` all PASS · `1` any FAIL · `2` any ERROR and no FAIL (including "no backups found") · `3` usage error. A FAIL outranks an ERROR, so CI fails on a broken backup even if another couldn't be tested.
 
 ### Receipts and keys
+The format is specified in [docs/RECEIPT-v1.md](docs/RECEIPT-v1.md).
 - On first run `xinproof` creates an Ed25519 key pair in `~/.xinproof/keys` (override with `XINPROOF_HOME`). `xinproof key` prints the key ID and public key.
 - Receipts are `receipts/receipt-NNNNNN.json`. Each one records the source, size, SHA-256, format, dump version, sandbox image (pinned by digest), result, reason, every check, timings, and the chain link (`chain.prev` = SHA-256 of the previous receipt's canonical bytes, signature included). Receipts contain no row data.
 - `xinproof receipt verify` works offline. It checks the signature and the link to the previous receipt (given on the command line, or `receipt-<seq-1>.json` next to it). Pass `--pubkey ed25519.pub` (or a base64 key) to pin the signer. Without it, receipts signed by this machine's key are pinned automatically, and others are checked against their embedded key and reported as **not pinned**.

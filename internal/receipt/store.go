@@ -33,6 +33,13 @@ func (s *Store) Append(r *Receipt, priv ed25519.PrivateKey) (string, error) {
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
 		return "", err
 	}
+	// Concurrent runs writing to the same directory must not fork the chain:
+	// read HEAD, write the receipt and update HEAD under one lock.
+	unlock, err := lockDir(s.Dir)
+	if err != nil {
+		return "", fmt.Errorf("locking %s: %w", s.Dir, err)
+	}
+	defer unlock()
 	h, err := s.head()
 	if err != nil {
 		return "", err
