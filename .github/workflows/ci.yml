@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      # Until go.sum is committed, resolve modules here and publish the result
+      # so it can be committed. Once committed, this must be a no-op.
+      - name: Resolve modules
+        run: |
+          go mod tidy
+          git diff --stat -- go.mod go.sum || true
+          git status --short -- go.mod go.sum
+
+      - name: Upload go.mod / go.sum
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-modules
+          path: |
+            go.mod
+            go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        if: success() || failure()
+        run: go vet ./...
+
+      - name: gofmt
+        if: success() || failure()
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "needs gofmt:"; echo "$out"; gofmt -d .; exit 1; fi
+
+      - name: Unit tests (race)
+        if: success() || failure()
+        run: go test -race -short -count=1 ./...
+
+      - name: Integration tests (real Postgres in Docker)
+        if: success() || failure()
+        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/
+
+      - name: Demo (one good, one truncated dump)
+        if: success() || failure()
+        run: bash scripts/demo.sh
+
+      - name: govulncheck
+        if: success() || failure()
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

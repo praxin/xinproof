@@ -1,0 +1,282 @@
+// Package sandbox runs restores in throwaway Docker containers with no
+// network, resource limits, a minimal capability set and guaranteed cleanup
+// (deferred removal, labels, and a TTL reaper that runs at the start of every
+// verify). It drives the docker CLI, so it works with Docker Engine, Docker
+// Desktop, colima or any other runtime that provides a docker-compatible CLI.
+package sandbox
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	LabelManaged = "xinproof.managed"
+	LabelRun     = "xinproof.run"
+	LabelExpires = "xinproof.expires"
+)
+
+type Docker struct {
+	Bin string // docker binary; "docker" if empty
+}
+
+func (d *Docker) bin() string {
+	if d.Bin == "" {
+		return "docker"
+	}
+	return d.Bin
+}
+
+// ErrUnavailable means the container runtime cannot be used at all.
+var ErrUnavailable = errors.New("docker is not available")
+
+// Available checks that the docker CLI exists and can reach a daemon.
+func (d *Docker) Available(ctx context.Context) error {
+	if _, err := exec.LookPath(d.bin()); err != nil {
+		return fmt.Errorf("%w: %q not found on PATH (install Docker Engine, or Docker Desktop on macOS/Windows)", ErrUnavailable, d.bin())
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	out, err := d.run(ctx, nil, "version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		return fmt.Errorf("%w: cannot reach the Docker daemon (%s)", ErrUnavailable, firstLine(out, err))
+	}
+	return nil
+}
+
+// EnsureImage makes sure image is present locally (pulling it if needed) and
+// returns its repo digest ("postgres@sha256:…") when known.
+func (d *Docker) EnsureImage(ctx context.Context, image string) (string, error) {
+	if _, err := d.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}", image); err != nil {
+		if out, err := d.run(ctx, nil, "pull", "--quiet", image); err != nil {
+			return "", fmt.Errorf("cannot pull sandbox image %s: %s", image, firstLine(out, err))
+		}
+	}
+	out, err := d.run(ctx, nil, "image", "inspect", "--format", "{{json .RepoDigests}}", image)
+	if err != nil {
+		return "", nil
+	}
+	var digests []string
+	if json.Unmarshal(bytes.TrimSpace(out), &digests) == nil && len(digests) > 0 {
+		return digests[0], nil
+	}
+	return "", nil
+}
+
+type Spec struct {
+	Name      string
+	Image     string
+	RunID     string
+	TTL       time.Duration // after this the reaper may remove the container
+	Env       []string      // KEY=VALUE; values are passed via the CLI's environment, never argv
+	Memory    string        // e.g. "2g"
+	CPUs      string        // e.g. "2"
+	PidsLimit int
+	TmpfsPath string // optional tmpfs mount point
+	TmpfsSize string // e.g. "1g"
+	CapAdd    []string
+}
+
+type Container struct {
+	d    *Docker
+	Name string
+}
+
+// Run starts a detached container. The returned Container is non-nil even on
+// error so the caller can always Remove it.
+func (d *Docker) Run(ctx context.Context, s Spec) (*Container, error) {
+	c := &Container{d: d, Name: s.Name}
+	args := []string{"run", "-d", "--name", s.Name,
+		"--label", LabelManaged + "=true",
+		"--label", LabelRun + "=" + s.RunID,
+		"--label", fmt.Sprintf("%s=%d", LabelExpires, time.Now().Add(s.TTL).Unix()),
+		"--network", "none",
+		"--security-opt", "no-new-privileges",
+		"--cap-drop", "ALL",
+	}
+	for _, cap := range s.CapAdd {
+		args = append(args, "--cap-add", cap)
+	}
+	if s.Memory != "" {
+		args = append(args, "--memory", s.Memory, "--memory-swap", s.Memory)
+	}
+	if s.CPUs != "" {
+		args = append(args, "--cpus", s.CPUs)
+	}
+	if s.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(s.PidsLimit))
+	}
+	if s.TmpfsPath != "" {
+		opt := s.TmpfsPath + ":rw,mode=1777"
+		if s.TmpfsSize != "" {
+			opt += ",size=" + s.TmpfsSize
+		}
+		args = append(args, "--tmpfs", opt)
+	}
+	var env []string
+	for _, kv := range s.Env {
+		k, _, _ := strings.Cut(kv, "=")
+		args = append(args, "-e", k)
+		env = append(env, kv)
+	}
+	args = append(args, s.Image)
+	if out, err := d.run(ctx, env, args...); err != nil {
+		return c, fmt.Errorf("cannot start sandbox container: %s", firstLine(out, err))
+	}
+	return c, nil
+}
+
+type ExecOpts struct {
+	Args   []string
+	Stdin  io.Reader
+	Stdout io.Writer // if nil, stdout is captured into ExecResult.Stdout (up to 64 MiB)
+	User   string
+}
+
+type ExecResult struct {
+	ExitCode int
+	Stdout   []byte
+	Stderr   string // first 64 KiB
+}
+
+// DaemonError reports whether a non-zero exit came from docker itself rather
+// than the command (for example because the container died).
+func (r ExecResult) DaemonError() bool {
+	return r.ExitCode != 0 && strings.Contains(r.Stderr, "Error response from daemon")
+}
+
+// Exec runs a command in the container. err is non-nil only if docker could
+// not be run; a failing command is reported through ExitCode.
+func (c *Container) Exec(ctx context.Context, o ExecOpts) (ExecResult, error) {
+	args := []string{"exec"}
+	if o.Stdin != nil {
+		args = append(args, "-i")
+	}
+	if o.User != "" {
+		args = append(args, "-u", o.User)
+	}
+	args = append(args, c.Name)
+	args = append(args, o.Args...)
+	cmd := exec.CommandContext(ctx, c.d.bin(), args...)
+	cmd.Stdin = o.Stdin
+	stdout := &capBuffer{max: 64 << 20}
+	if o.Stdout != nil {
+		cmd.Stdout = o.Stdout
+	} else {
+		cmd.Stdout = stdout
+	}
+	stderr := &capBuffer{max: 64 << 10}
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	res := ExecResult{Stdout: stdout.Bytes(), Stderr: stderr.String()}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
+		res.ExitCode = ee.ExitCode()
+		return res, nil
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
+		return res, err
+	}
+	return res, nil
+}
+
+// Running reports whether the container is still running.
+func (c *Container) Running(ctx context.Context) bool {
+	out, err := c.d.run(ctx, nil, "inspect", "--format", "{{.State.Running}}", c.Name)
+	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+// Logs returns the last lines of the container's output, for error messages.
+func (c *Container) Logs(ctx context.Context, lines int) string {
+	out, _ := c.d.run(ctx, nil, "logs", "--tail", strconv.Itoa(lines), c.Name)
+	return strings.TrimSpace(string(out))
+}
+
+// Remove force-removes the container and its anonymous volumes. It uses its
+// own short timeout so it still runs after the caller's context is cancelled.
+func (c *Container) Remove() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := c.d.run(ctx, nil, "rm", "-f", "-v", c.Name)
+	if err != nil && !strings.Contains(string(out), "No such container") {
+		return fmt.Errorf("removing sandbox %s: %s", c.Name, firstLine(out, err))
+	}
+	return nil
+}
+
+// Reap removes xinproof containers whose TTL has expired, e.g. left behind by
+// a run that was killed. It returns how many it removed.
+func (d *Docker) Reap(ctx context.Context) (int, error) {
+	out, err := d.run(ctx, nil, "ps", "-a", "--filter", "label="+LabelManaged+"=true",
+		"--format", `{{.Names}}	{{.Label "`+LabelExpires+`"}}`)
+	if err != nil {
+		return 0, fmt.Errorf("listing old sandboxes: %s", firstLine(out, err))
+	}
+	now := time.Now().Unix()
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name, exp, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		ts, err := strconv.ParseInt(strings.TrimSpace(exp), 10, 64)
+		if err != nil || ts > now {
+			continue
+		}
+		if (&Container{d: d, Name: name}).Remove() == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (d *Docker) run(ctx context.Context, env []string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, d.bin(), args...)
+	if env != nil {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	return cmd.CombinedOutput()
+}
+
+func firstLine(out []byte, err error) string {
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return err.Error()
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+// capBuffer keeps the first max bytes written and discards the rest.
+type capBuffer struct {
+	bytes.Buffer
+	max int
+}
+
+func (b *capBuffer) Write(p []byte) (int, error) {
+	if room := b.max - b.Len(); room > 0 {
+		if len(p) > room {
+			b.Buffer.Write(p[:room])
+		} else {
+			b.Buffer.Write(p)
+		}
+	}
+	return len(p), nil
+}
