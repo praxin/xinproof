@@ -86,8 +86,8 @@ jobs:
         run: go test -count=1 -v -run 'Conformance|EndToEnd|AzureErrors' ./internal/source/... ./internal/verify/
 
       # Real AWS, no credentials: a public AWS Open Data bucket in eu-central-1
-      # (region auto-detected). Real-account tests for AWS/Azure/GCP/R2 come
-      # with read-only test identities.
+      # (region auto-detected). Real-account tests with read-only identities
+      # live in real-cloud.yml.
       - name: Real AWS (public bucket, unsigned)
         if: success() || failure()
         env:
