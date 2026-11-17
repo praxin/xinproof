@@ -1,13 +1,16 @@
 # Release: push a tag like v0.1.0. Builds Linux and macOS binaries (amd64 and
 # arm64), SHA-256 checksums, a GitHub Release, and a multi-arch image at
-# ghcr.io/praxin/xinproof. Running it by hand (workflow_dispatch) is a dry
-# run: everything is built and smoke-tested, nothing is published.
+# ghcr.io/praxin/xinproof. Running it by hand (workflow_dispatch) or on a pull
+# request that changes the release files is a dry run: everything is built and
+# smoke-tested, nothing is published.
 name: release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request: # dry run when the release itself changes
+    paths: [".github/workflows/release.yml", "Dockerfile", ".dockerignore", "go.mod", "go.sum"]
 
 permissions:
   contents: write  # create the GitHub Release
