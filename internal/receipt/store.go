@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
 )
 
 // Store is a local directory of receipts plus a HEAD file recording the chain head.
@@ -40,6 +41,7 @@ func (s *Store) Append(r *Receipt, priv ed25519.PrivateKey) (string, error) {
 		return "", fmt.Errorf("locking %s: %w", s.Dir, err)
 	}
 	defer unlock()
+	s.removeStaleTemp()
 	h, err := s.head()
 	if err != nil {
 		return "", err
@@ -68,7 +70,9 @@ func (s *Store) Append(r *Receipt, priv ed25519.PrivateKey) (string, error) {
 	return path, nil
 }
 
-// head reads HEAD, or rebuilds it from the highest-numbered receipt if HEAD is missing.
+// head reads HEAD. It rebuilds it from the highest-numbered receipt when HEAD
+// is missing, or stale because a run was killed after writing a receipt but
+// before updating HEAD.
 func (s *Store) head() (head, error) {
 	b, err := os.ReadFile(filepath.Join(s.Dir, "HEAD"))
 	if err == nil {
@@ -76,9 +80,10 @@ func (s *Store) head() (head, error) {
 		if err := json.Unmarshal(b, &h); err != nil {
 			return head{}, fmt.Errorf("receipts HEAD is corrupt: %w", err)
 		}
-		return h, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(s.Dir, FileName(h.Seq+1))); err != nil {
+			return h, nil // HEAD is current
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return head{}, err
 	}
 	entries, err := os.ReadDir(s.Dir)
@@ -109,6 +114,16 @@ func (s *Store) head() (head, error) {
 		return head{}, fmt.Errorf("cannot continue chain from %s: %w", bestName, err)
 	}
 	return head{Seq: v.Receipt.Chain.Seq, Hash: v.Hash, File: bestName}, nil
+}
+
+// removeStaleTemp deletes temp files left by a process killed mid-write.
+func (s *Store) removeStaleTemp() {
+	matches, _ := filepath.Glob(filepath.Join(s.Dir, ".tmp-*"))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > time.Minute {
+			os.Remove(m)
+		}
+	}
 }
 
 func writeAtomic(path string, data []byte, exclusive bool) error {

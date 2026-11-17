@@ -85,6 +85,10 @@ jobs:
         if: success() || failure()
         run: go test -count=1 -v -run 'Conformance|EndToEnd|AzureErrors' ./internal/source/... ./internal/verify/
 
+      - name: Chaos tests (killed sandbox, blown budget, full disk, SIGKILL, Ctrl-C)
+        if: success() || failure()
+        run: go test -count=1 -v -timeout 20m ./internal/chaos/
+
       - name: Demo (one good, one truncated dump)
         if: success() || failure()
         env:

@@ -34,7 +34,21 @@ Status: pre-release (0.1.0). PostgreSQL (13–18) and MySQL / MariaDB (MySQL 8.0
    - restore duration (the measured RTO).
 5. **Signs a receipt** for every backup: Ed25519 over the RFC 8785 canonical JSON, hash-chained to the previous receipt.
 
-Every backup ends in exactly one of **PASS**, **FAIL** (it won't restore, with the reason) or **ERROR** (it couldn't be tested, with the reason). Nothing is silently skipped. Sandboxes are always removed: on success, on failure, on Ctrl-C, and, if the CLI is killed, by a reaper at the start of the next run (containers carry `xinproof.*` labels and an expiry).
+Every backup ends in exactly one of **PASS**, **FAIL** (it won't restore, with the reason) or **ERROR** (it couldn't be tested, with the reason). Nothing is silently skipped.
+
+### When things go wrong
+xinproof blames the backup only when the backup is at fault. Everything else is an ERROR that says what broke, and each scenario below is a test that runs in CI (`internal/chaos`, `internal/verify`):
+
+| What happens | Result |
+| --- | --- |
+| Network drops mid-download (even for a gzip that then looks truncated) | ERROR `reading object: unexpected EOF` |
+| Sandbox container killed or OOM-killed mid-restore | ERROR naming the sandbox (`raise --memory` for OOM) |
+| Sandbox database crashes (connection lost mid-restore) | ERROR, not FAIL |
+| Sandbox runs out of disk | ERROR `No space left on device` |
+| Restore exceeds `--timeout` | ERROR `… exceeded the time budget` |
+| Ctrl-C / SIGTERM | current restore stopped, its sandbox removed, every untested backup reported as ERROR with a receipt; exit 2 |
+| CLI killed with SIGKILL | the next run removes the orphaned sandbox at once (its owner process is gone; containers carry `xinproof.pid` / `xinproof.host` labels, plus an expiry for sandboxes started from other hosts) |
+| Killed between writing a receipt and updating `HEAD` | the next run notices, rebuilds `HEAD` from the receipts, and continues the chain |
 
 ## Requirements
 - Docker: Docker Engine on Linux; Docker Desktop (or colima, etc.) on macOS; Docker Desktop with WSL2 on Windows.
@@ -106,7 +120,7 @@ go test -short ./...                       # unit tests, no Docker needed
 go test ./...                              # plus real restores in Docker (corrupted dumps must FAIL)
 bash scripts/demo.sh                       # one good + one truncated dump, end to end
 ```
-CI (`.github/workflows/ci.yml`) runs a `go mod tidy` drift check, cross-builds, vet, gofmt, race-enabled unit tests, the storage conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), restores against every supported PostgreSQL (13–18), MySQL (8.0, 8.4) and MariaDB (10.11, 11.4), the demo, the JSON/JUnit report checks and govulncheck on every push.
+CI (`.github/workflows/ci.yml`) runs a `go mod tidy` drift check, cross-builds, vet, gofmt, race-enabled unit tests, the storage conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), restores against every supported PostgreSQL (13–18), MySQL (8.0, 8.4) and MariaDB (10.11, 11.4), the chaos tests, the demo, the JSON/JUnit report checks and govulncheck on every push.
 
 ## License
 Apache-2.0 (planned)

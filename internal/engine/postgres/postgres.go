@@ -43,6 +43,7 @@ type Engine struct {
 	// AmcheckBudget limits B-tree index verification (amcheck) per database;
 	// 0 disables it. Indexes are checked largest first.
 	AmcheckBudget time.Duration
+	Hooks         engine.Hooks // fault injection for tests
 
 	seq       atomic.Int64
 	availOnce sync.Once
@@ -138,7 +139,7 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 	}
 	spec.Env = env
 	c, err := e.Docker.Run(ctx, spec)
-	s := &session{c: c, image: ref, det: d, amcheck: e.AmcheckBudget}
+	s := &session{c: c, image: ref, det: d, amcheck: e.AmcheckBudget, hooks: e.Hooks}
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -155,7 +156,21 @@ type session struct {
 	image   string
 	det     discover.Detection
 	amcheck time.Duration
+	hooks   engine.Hooks
 	once    sync.Once
+}
+
+// sandboxBroke reports, as an ERROR reason, whether a failed command failed
+// because the sandbox broke (container died, out of memory or disk, server
+// crashed) rather than because of the backup.
+func (s *session) sandboxBroke(res sandbox.ExecResult) string {
+	if why := s.c.Died(); why != "" {
+		return why
+	}
+	if res.DaemonError() {
+		return "sandbox failed: " + lastLines(res.Stderr, 1)
+	}
+	return engine.SandboxFault(res.Stderr)
 }
 
 func (s *session) Image() string { return s.image }
@@ -262,6 +277,9 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 			return errOut("sandbox failed: " + lastLines(res.Stderr, 1))
 		}
 		if res.ExitCode != 0 {
+			if why := s.sandboxBroke(res); why != "" {
+				return errOut(why)
+			}
 			return failOut("l2.toc", "archive TOC unreadable: "+firstErrors(res.Stderr))
 		}
 		tables, entries := CountTOC(string(res.Stdout))
@@ -298,6 +316,9 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 		return errOut("unsupported format " + string(s.det.Format))
 	}
 
+	if s.hooks.BeforeRestore != nil {
+		s.hooks.BeforeRestore(s.c.Name)
+	}
 	start := time.Now()
 	res, err := s.exec(ctx, restoreArgs...)
 	dur := time.Since(start)
@@ -309,6 +330,9 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 		return errOut("sandbox failed during restore: " + lastLines(res.Stderr, 1))
 	}
 	if res.ExitCode != 0 {
+		if why := s.sandboxBroke(res); why != "" {
+			return errOut(why + " · " + firstErrors(res.Stderr))
+		}
 		return failOut("l2.restore", fmt.Sprintf("%s failed (exit %d): %s", restoreArgs[0], res.ExitCode, firstErrors(res.Stderr)))
 	}
 	out.Checks = append(out.Checks, receipt.Check{ID: "l2.restore", Status: receipt.CheckPass,
@@ -323,6 +347,9 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 			return execErr(err, "reading the dump's data for the row audit")
 		}
 		if res.ExitCode != 0 {
+			if why := s.sandboxBroke(res); why != "" {
+				return errOut(why)
+			}
 			return failOut("l2.rows", "the dump's data section can't be read: "+firstErrors(res.Stderr))
 		}
 		dumpRows = counter.Rows

@@ -24,6 +24,8 @@ const (
 	LabelManaged = "xinproof.managed"
 	LabelRun     = "xinproof.run"
 	LabelExpires = "xinproof.expires"
+	LabelPID     = "xinproof.pid"  // process that created the sandbox
+	LabelHost    = "xinproof.host" // host that process ran on
 )
 
 type Docker struct {
@@ -110,6 +112,8 @@ func (d *Docker) Run(ctx context.Context, s Spec) (*Container, error) {
 		"--label", LabelManaged + "=true",
 		"--label", LabelRun + "=" + s.RunID,
 		"--label", fmt.Sprintf("%s=%d", LabelExpires, time.Now().Add(s.TTL).Unix()),
+		"--label", fmt.Sprintf("%s=%d", LabelPID, os.Getpid()),
+		"--label", LabelHost + "=" + hostname(),
 		"--network", "none",
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL",
@@ -223,6 +227,26 @@ func (c *Container) Running(ctx context.Context) bool {
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
+// Died explains why a container that should be running isn't (killed, out
+// of memory, gone). It returns "" if the container is still running. It uses
+// its own context so it works after the caller's deadline.
+func (c *Container) Died() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := c.d.run(ctx, nil, "inspect", "--format", "{{.State.Running}} {{.State.OOMKilled}} {{.State.ExitCode}}", c.Name)
+	if err != nil {
+		return "the sandbox container disappeared"
+	}
+	f := strings.Fields(string(out))
+	if len(f) != 3 || f[0] == "true" {
+		return ""
+	}
+	if f[1] == "true" {
+		return "the sandbox ran out of memory and was killed (raise --memory)"
+	}
+	return "the sandbox container stopped (exit code " + f[2] + ")"
+}
+
 // Logs returns the last lines of the container's output, for error messages.
 func (c *Container) Logs(ctx context.Context, lines int) string {
 	out, _ := c.d.run(ctx, nil, "logs", "--tail", strconv.Itoa(lines), c.Name)
@@ -243,27 +267,38 @@ func (c *Container) Remove() error {
 	return nil
 }
 
-// Reap removes xinproof containers whose TTL has expired, e.g. left behind by
-// a run that was killed. It returns how many it removed.
+// Reap removes sandboxes left behind by runs that were killed: those whose
+// creating process (on this host) no longer exists, and any whose TTL has
+// expired. Sandboxes of other live runs are left alone. It returns how many
+// it removed.
 func (d *Docker) Reap(ctx context.Context) (int, error) {
 	out, err := d.run(ctx, nil, "ps", "-a", "--filter", "label="+LabelManaged+"=true",
-		"--format", `{{.Names}}	{{.Label "`+LabelExpires+`"}}`)
+		"--format", `{{.Names}}	{{.Label "`+LabelExpires+`"}}	{{.Label "`+LabelPID+`"}}	{{.Label "`+LabelHost+`"}}`)
 	if err != nil {
 		return 0, fmt.Errorf("listing old sandboxes: %s", firstLine(out, err))
 	}
 	now := time.Now().Unix()
+	host := hostname()
 	n := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		name, exp, ok := strings.Cut(line, "\t")
-		if !ok {
+		f := strings.Split(line, "\t")
+		if len(f) < 2 {
 			continue
 		}
-		ts, err := strconv.ParseInt(strings.TrimSpace(exp), 10, 64)
-		if err != nil || ts > now {
+		name := f[0]
+		ts, err := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
+		expired := err == nil && ts <= now
+		orphaned := false
+		if len(f) == 4 && f[3] == host {
+			if pid, err := strconv.Atoi(f[2]); err == nil && pid != os.Getpid() && !processAlive(pid) {
+				orphaned = true
+			}
+		}
+		if !expired && !orphaned {
 			continue
 		}
 		if (&Container{d: d, Name: name}).Remove() == nil {
-			d.log().Info("reaped expired sandbox", "container", name)
+			d.log().Info("reaped leftover sandbox", "container", name, "expired", expired, "orphaned", orphaned)
 			n++
 		}
 	}

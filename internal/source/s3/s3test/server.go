@@ -34,6 +34,9 @@ type Server struct {
 	Bucket   string
 	PageSize int    // keys per ListObjectsV2 page (default 1000)
 	Deny     string // if set, every request fails with this S3 error code and 403
+	// CutAfter, if > 0, makes object downloads drop the connection after this
+	// many body bytes (the response promised the full length): a network cut.
+	CutAfter int
 
 	mu       sync.Mutex
 	objects  map[string]Object
@@ -92,6 +95,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		s.headers(w, o)
 		w.WriteHeader(http.StatusOK)
+		if s.CutAfter > 0 && len(o.Body) > s.CutAfter {
+			w.Write(o.Body[:s.CutAfter])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler) // closes the connection mid-body
+		}
 		w.Write(o.Body)
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "the test server is read-only")

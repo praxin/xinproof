@@ -45,6 +45,7 @@ type Engine struct {
 	TTL       time.Duration
 	// CheckBudget limits CHECK TABLE (table and index consistency) per run; 0 disables it.
 	CheckBudget time.Duration
+	Hooks       engine.Hooks // fault injection for tests
 
 	seq       atomic.Int64
 	availOnce sync.Once
@@ -133,7 +134,7 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 		spec.TmpfsPath, spec.TmpfsSize = "/xinproof", e.TmpfsSize
 	}
 	c, err := e.Docker.Run(ctx, spec)
-	s := &session{c: c, image: ref, maria: maria, budget: e.CheckBudget, pass: pass}
+	s := &session{c: c, image: ref, maria: maria, budget: e.CheckBudget, pass: pass, hooks: e.Hooks}
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -151,6 +152,7 @@ type session struct {
 	maria  bool
 	budget time.Duration
 	pass   string
+	hooks  engine.Hooks
 	once   sync.Once
 }
 
@@ -263,6 +265,9 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	// The client stops at the first error (no --force), so any failing
 	// statement fails the restore, like psql's ON_ERROR_STOP.
 	cmd := strings.Join(s.clientArgs(), " ") + " --max-allowed-packet=1G " + restoreDB + " < " + dumpPath
+	if s.hooks.BeforeRestore != nil {
+		s.hooks.BeforeRestore(s.c.Name)
+	}
 	start := time.Now()
 	res, err := s.exec(ctx, sandbox.ExecOpts{Args: []string{"sh", "-c", cmd}})
 	dur := time.Since(start)
@@ -274,6 +279,13 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 		return errOut("sandbox failed during restore: " + lastLines(res.Stderr, 1))
 	}
 	if res.ExitCode != 0 {
+		// The sandbox breaking (killed, out of memory or disk, server crashed) is not the backup's fault.
+		if why := s.c.Died(); why != "" {
+			return errOut(why + " · " + firstErrors(res.Stderr))
+		}
+		if why := engine.SandboxFault(res.Stderr); why != "" {
+			return errOut(why + " · " + firstErrors(res.Stderr))
+		}
 		return failOut("l2.restore", fmt.Sprintf("%s failed (exit %d): %s", s.client(), res.ExitCode, firstErrors(res.Stderr)))
 	}
 	out.Checks = append(out.Checks, receipt.Check{ID: "l2.restore", Status: receipt.CheckPass, Detail: fmt.Sprintf("exit 0 in %.1fs", dur.Seconds())})
