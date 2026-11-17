@@ -51,6 +51,9 @@ type Outcome struct {
 	Tables         int
 	Rows           int64
 	RowsKnown      bool
+	// TableCounts are the restored tables with exact row counts, when the
+	// engine got as far as counting them; they become the receipt's "tables".
+	TableCounts []TableCount
 }
 
 // Seconds rounds a duration to milliseconds for receipts.

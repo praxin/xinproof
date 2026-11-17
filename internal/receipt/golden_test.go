@@ -106,6 +106,41 @@ func TestGoldenReceipt(t *testing.T) {
 	}
 }
 
+// TestTablesField checks the optional "tables" member: absent when there are
+// no counts (so receipts without it, like the golden one, are unchanged),
+// present with the documented shape otherwise, and covered by the signature.
+func TestTablesField(t *testing.T) {
+	priv := goldenKey()
+	pub := priv.Public().(ed25519.PublicKey)
+
+	plain := sample(Pass)
+	b, _ := json.Marshal(plain)
+	if bytes.Contains(b, []byte(`"tables"`)) {
+		t.Errorf("receipt without counts has a tables member: %s", b)
+	}
+
+	r := sample(Pass)
+	r.Tables = []Table{{Name: "public.customers", Rows: 5000}, {Name: "public.orders", Rows: 40000}}
+	if err := r.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := json.Marshal(r)
+	if !bytes.Contains(doc, []byte(`"tables":[{"name":"public.customers","rows":5000},{"name":"public.orders","rows":40000}]`)) {
+		t.Errorf("unexpected tables encoding: %s", doc)
+	}
+	v, err := Verify(doc, []ed25519.PublicKey{pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Receipt.Tables) != 2 || v.Receipt.Tables[1].Rows != 40000 {
+		t.Errorf("tables after verify: %+v", v.Receipt.Tables)
+	}
+	tampered := bytes.Replace(doc, []byte(`"rows":40000`), []byte(`"rows":40001`), 1)
+	if _, err := Verify(tampered, []ed25519.PublicKey{pub}); err == nil {
+		t.Error("a changed row count still verifies")
+	}
+}
+
 func TestConcurrentAppendsKeepOneChain(t *testing.T) {
 	dir := t.TempDir()
 	priv := testKey(t)

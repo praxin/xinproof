@@ -54,6 +54,9 @@ CREATE FUNCTION fmt_total(t DECIMAL(10,2)) RETURNS VARCHAR(20) DETERMINISTIC RET
 
 const fixtureTables, fixtureRows = 4, 10 + 10000 + 40000 + 20000
 
+// fixtureTableCounts is the receipt's "tables" for the fixture, as fmt prints it.
+const fixtureTableCounts = "[{audit_log 20000} {customers 10000} {digits 10} {orders 40000}]"
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
@@ -218,6 +221,13 @@ func TestRealRestores(t *testing.T) {
 				if status[id] != receipt.CheckPass {
 					t.Errorf("%s: check %s = %q, want pass", r.Object.Name, id, status[id])
 				}
+			}
+			wantTables := fixtureTableCounts
+			if r.Object.Name == "good-databases.sql" { // --databases shop restores into its own database
+				wantTables = strings.ReplaceAll(wantTables, "{", "{shop:")
+			}
+			if got := fmt.Sprint(r.Receipt.Tables); got != wantTables {
+				t.Errorf("%s: receipt tables %s, want %s", r.Object.Name, got, wantTables)
 			}
 		}
 		doc, err := os.ReadFile(r.ReceiptPath)

@@ -25,14 +25,15 @@ A receipt is a JSON document that records what xinproof did to one backup and wh
 | `measured.restore_seconds` | number | Wall-clock restore time (the measured RTO). Milliseconds precision. |
 | `measured.total_seconds` | number | Wall-clock time for the whole verification of this backup. |
 | `checks[]` | array | Each `{id, status, detail}`. `status` is `pass`, `fail`, `error`, `skip` or `info`. |
+| `tables[]` | array | *Optional* (added within v1; absent when no table was counted, e.g. the restore failed or the database has no tables). Each `{"name": string, "rows": integer}`: every restored table with its exact row count after restore, sorted by `name` (byte order). `name` is `schema.table` (Postgres) or `table` (MySQL/MariaDB); a table in a database other than the one the dump was restored into (`pg_dump -C`, `pg_dumpall`, `mysqldump --databases`) is prefixed `<database>:`. Postgres partitioned parents are listed too and count the rows of all their partitions. At most 2000 entries: if there are more, the first 2000 by name are kept and an `l2.tables` info check says how many there were. Present on `FAIL` receipts too when the tables were counted (e.g. a row-audit failure). |
 | `tool` | object | `name`, `version`, `commit` of the xinproof build that issued it. |
 | `chain.seq` | integer | Position in the chain, starting at 1. |
 | `chain.prev` | string | `sha256:<hex>` of the previous receipt (see §3). For seq 1 it is `sha256:` followed by 64 zeros. |
 | `signature` | object | See §2. |
 
-Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck` (Postgres), `l2.check_table` (MySQL/MariaDB). New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
+Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck` (Postgres), `l2.check_table` (MySQL/MariaDB), `l2.tables` (info: the `tables` list was capped). New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
 
-**Privacy:** receipts never contain row data. They contain counts, hashes, versions and the backup's location.
+**Privacy:** receipts never contain row data. They contain counts, hashes, versions, the backup's location and (in `tables`) table names with their row counts.
 
 ## 2. Signature
 

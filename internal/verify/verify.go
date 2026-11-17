@@ -709,7 +709,14 @@ func (v *Verifier) build(d *draft, total time.Duration) *receipt.Receipt {
 	r.Result, r.Reason = d.out.Result, d.out.Reason
 	r.Measured = receipt.Measured{RestoreSeconds: d.out.RestoreSeconds, TotalSeconds: engine.Seconds(total)}
 	if d.checks != nil {
-		r.Checks = d.checks
+		r.Checks = append([]receipt.Check(nil), d.checks...)
+	}
+	if tables, total := engine.ReceiptTables(d.out.TableCounts); len(tables) > 0 {
+		r.Tables = tables
+		if total > len(tables) {
+			r.Checks = append(r.Checks, receipt.Check{ID: "l2.tables", Status: receipt.CheckInfo,
+				Detail: fmt.Sprintf("tables list capped: first %d of %d tables by name", len(tables), total)})
+		}
 	}
 	r.Tool = receipt.Tool{Name: "xinproof", Version: v.Opts.ToolVersion, Commit: v.Opts.ToolCommit}
 	return r

@@ -53,6 +53,7 @@ type Receipt struct {
 	Reason    string     `json:"reason,omitempty"`
 	Measured  Measured   `json:"measured"`
 	Checks    []Check    `json:"checks"`
+	Tables    []Table    `json:"tables,omitempty"` // optional (added in v1): restored tables with exact row counts
 	Tool      Tool       `json:"tool"`
 	Chain     Chain      `json:"chain"`
 	Signature *Signature `json:"signature,omitempty"`
@@ -85,6 +86,16 @@ type Check struct {
 	Status string `json:"status"`
 	Detail string `json:"detail,omitempty"`
 }
+
+// Table is one restored table (or collection) and its exact row (document)
+// count after restore. Names and counts only, never row data.
+type Table struct {
+	Name string `json:"name"`
+	Rows int64  `json:"rows"`
+}
+
+// MaxTables caps the tables list in a receipt; the first MaxTables by name are kept.
+const MaxTables = 2000
 
 type Tool struct {
 	Name    string `json:"name"`
