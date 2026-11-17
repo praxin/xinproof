@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -55,6 +56,20 @@ type Outcome struct {
 	// engine got as far as counting them; they become the receipt's "tables".
 	TableCounts []TableCount
 }
+
+// Querier is implemented by sessions that can run a SQL query in the restored
+// database, for user-defined checks (xinproof verify --check).
+type Querier interface {
+	// QueryValue runs query in the database the dump was restored into. The
+	// query must return exactly one row with one column; anything else is an
+	// error. null reports SQL NULL. Errors caused by the sandbox rather than
+	// the query wrap ErrSandbox.
+	QueryValue(ctx context.Context, query string) (value string, null bool, err error)
+}
+
+// ErrSandbox marks errors caused by the sandbox (container died, daemon
+// error, server crash) rather than by the backup or a query.
+var ErrSandbox = errors.New("sandbox failed")
 
 // Seconds rounds a duration to milliseconds for receipts.
 func Seconds(d time.Duration) float64 { return float64(d.Milliseconds()) / 1000 }

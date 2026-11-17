@@ -35,6 +35,9 @@ type Options struct {
 	ToolCommit  string
 	Now         func() time.Time
 	Log         *slog.Logger // structured logs; nil discards
+	// Checks are user-defined SQL checks run in the sandbox after a
+	// successful restore (--check); a failing one fails the backup.
+	Checks []CustomCheck
 
 	// OnPlan is called once the candidates are known; OnStart before and
 	// OnResult after each backup is processed.
@@ -394,6 +397,7 @@ func (v *Verifier) one(parent context.Context, u unit) (res Result) {
 		d.out = errorOutcome("engine returned no result")
 	}
 	d.checks = append(d.checks, d.out.Checks...)
+	v.runCustomChecks(ctx, sess, d)
 	return
 }
 
@@ -500,6 +504,7 @@ func (v *Verifier) oneDir(ctx context.Context, d *draft, u unit, budget func(err
 		d.out = errorOutcome("engine returned no result")
 	}
 	d.checks = append(d.checks, d.out.Checks...)
+	v.runCustomChecks(ctx, sess, d)
 }
 
 // streamMember reads one file of a directory dump, adds it to the tar (if

@@ -147,6 +147,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	output := fs.String("output", "", "write the json/junit report to this file (human output stays on stdout)")
 	logLevel := fs.String("log-level", "warn", "structured log level on stderr: debug, info, warn, error, off")
 	logFormat := fs.String("log-format", "text", "structured log format: text or json")
+	var checks customChecks
+	fs.Var(&checks, "check", "custom check `name=SQL`, repeatable: after a successful restore, run SQL in the restored database; it must return one row with one truthy value, or the backup FAILs")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: xinproof verify [flags] <location>")
 		fs.PrintDefaults()
@@ -293,6 +295,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 			OnStart:     func(o source.Object) { h.Start(o.Name) },
 			OnResult:    h.Result,
 			Log:         logger,
+			Checks:      checks,
 		},
 	}
 	results, err := v.Run(ctx)
@@ -315,6 +318,25 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return writeReport(results, exitError, err)
 	}
 	return writeReport(results, verify.ExitCode(results), nil)
+}
+
+// customChecks collects repeated --check name=SQL flags.
+type customChecks []verify.CustomCheck
+
+func (c *customChecks) String() string { return "" }
+
+func (c *customChecks) Set(s string) error {
+	ck, err := verify.ParseCustomCheck(s)
+	if err != nil {
+		return err
+	}
+	for _, o := range *c {
+		if o.Name == ck.Name {
+			return fmt.Errorf("custom check %q given twice", ck.Name)
+		}
+	}
+	*c = append(*c, ck)
+	return nil
 }
 
 func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {

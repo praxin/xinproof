@@ -31,9 +31,9 @@ A receipt is a JSON document that records what xinproof did to one backup and wh
 | `chain.prev` | string | `sha256:<hex>` of the previous receipt (see §3). For seq 1 it is `sha256:` followed by 64 zeros. |
 | `signature` | object | See §2. |
 
-Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck` (Postgres), `l2.check_table` (MySQL/MariaDB), `l2.tables` (info: the `tables` list was capped). New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
+Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck` (Postgres), `l2.check_table` (MySQL/MariaDB), `l2.tables` (info: the `tables` list was capped), `l3.custom` (one per `--check name=SQL`, in the order given; `detail` is `<name>: <value or error>`, at most 200 characters; `pass` when the query returned one truthy value, `fail` when it returned a falsy value, not exactly one row and one column, or a SQL error, which makes the backup `FAIL` with reason `custom check "<name>" failed: …`; `error` when the sandbox broke while it ran, which makes the backup `ERROR` unless another check failed; `skip` when the restore did not pass or the engine has no SQL). New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
 
-**Privacy:** receipts never contain row data. They contain counts, hashes, versions, the backup's location and (in `tables`) table names with their row counts.
+**Privacy:** receipts never contain row data. They contain counts, hashes, versions, the backup's location and (in `tables`) table names with their row counts. The one exception is under the operator's control: an `l3.custom` check records the single value its query returned, so write checks that return a boolean or a count, not data.
 
 ## 2. Signature
 
