@@ -148,6 +148,25 @@ func TestSniff(t *testing.T) {
 	}
 }
 
+func TestMySQLFlavors(t *testing.T) {
+	tests := []struct {
+		name, in, dump, server, flavor string
+	}{
+		{"mysqldump", plainMySQL, "8.0.36", "8.0.36", "mysql"},
+		{"mariadb-dump", "/*M!999999\\- enable the sandbox mode */ \n-- MariaDB dump 10.19-11.4.2-MariaDB, for debian-linux-gnu (x86_64)\n--\n-- Server version\t11.4.2-MariaDB-ubu2404\n",
+			"11.4.2-MariaDB", "11.4.2-MariaDB-ubu2404", "mariadb"},
+		{"old mariadb mysqldump", "-- MySQL dump 10.19  Distrib 10.6.16-MariaDB, for debian-linux-gnu (x86_64)\n-- Server version\t10.6.16-MariaDB-1:10.6.16+maria~ubu2004\n",
+			"10.6.16-MariaDB", "10.6.16-MariaDB-1:10.6.16+maria~ubu2004", "mariadb"},
+		{"skip-comments", "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n/*!50503 SET NAMES utf8mb4 */;\n", "", "", "mysql"},
+	}
+	for _, tt := range tests {
+		d := Sniff([]byte(tt.in))
+		if d.Format != FormatMySQL || d.DumpVersion != tt.dump || d.ServerVersion != tt.server || d.Flavor != tt.flavor || d.Problem != "" {
+			t.Errorf("%s: %+v", tt.name, d)
+		}
+	}
+}
+
 func TestIsCandidate(t *testing.T) {
 	tests := map[string]bool{
 		"pg_2026-11-14.dump":  true,

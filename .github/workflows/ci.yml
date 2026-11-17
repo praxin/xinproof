@@ -77,9 +77,9 @@ jobs:
         if: success() || failure()
         run: go test -race -short -count=1 ./...
 
-      - name: Integration tests (real Postgres in Docker)
+      - name: Integration tests (real Postgres and MySQL in Docker)
         if: success() || failure()
-        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/
+        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/ ./internal/engine/mysql/
 
       - name: Demo (one good, one truncated dump)
         if: success() || failure()
@@ -126,3 +126,22 @@ jobs:
         env:
           XINPROOF_TEST_PG_IMAGE: postgres:${{ matrix.pg }}
         run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/
+
+  # MySQL and MariaDB: real mysqldump / mariadb-dump output, clean and corrupted.
+  mysql-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mysql:8.0", "mysql:8.4", "mariadb:10.11", "mariadb:11.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Integration tests against ${{ matrix.image }}
+        env:
+          XINPROOF_TEST_MYSQL_IMAGE: ${{ matrix.image }}
+        run: go test -count=1 -v -timeout 25m -run 'TestReal' ./internal/engine/mysql/

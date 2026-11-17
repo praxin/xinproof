@@ -24,6 +24,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/praxin/xinproof/internal/engine"
+	mysqlengine "github.com/praxin/xinproof/internal/engine/mysql"
 	"github.com/praxin/xinproof/internal/engine/postgres"
 	"github.com/praxin/xinproof/internal/receipt"
 	"github.com/praxin/xinproof/internal/report"
@@ -55,7 +57,8 @@ Usage:
 
 Locations:
   ./dumps/  /mnt/backups/pg.dump            local folder (recursive) or one file
-                                            (pg_dump custom, tar, directory and plain SQL; gzip/zstd/lz4)
+                                            (pg_dump custom, tar, directory and plain SQL;
+                                             mysqldump / mariadb-dump; optionally gzip/zstd/lz4)
   s3://bucket/prefix/                       AWS S3 (standard AWS credential chain)
   s3://bucket/prefix/ --endpoint URL        any S3-compatible store (MinIO, B2, Wasabi, …)
   r2://bucket/prefix/                       Cloudflare R2 (needs --r2-account-id or R2_ACCOUNT_ID)
@@ -117,13 +120,14 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	since := fs.String("since", "", "only backups modified within this window, e.g. 7d or 36h")
 	newest := fs.Int("newest", 0, "only test the newest N backups (0 = all)")
-	engineName := fs.String("engine", "auto", "database engine: auto or postgres")
+	engineName := fs.String("engine", "auto", "database engines to use: auto (all), postgres or mysql")
 	receiptsDir := fs.String("receipts", "receipts", "directory for signed receipts (hash-chained)")
 	timeout := fs.Duration("timeout", 2*time.Hour, "per-backup time budget")
 	memory := fs.String("memory", "2g", "sandbox memory limit")
 	cpus := fs.String("cpus", "2", "sandbox CPU limit")
 	tmpfs := fs.String("tmpfs", "", "keep the dump and restored data on a tmpfs of this size (e.g. 2g) instead of disk")
-	amcheck := fs.Duration("amcheck-budget", 10*time.Minute, "time budget per database for B-tree index verification (amcheck); 0 disables")
+	amcheck := fs.Duration("amcheck-budget", 10*time.Minute, "time budget for index verification: amcheck per Postgres database, CHECK TABLE per MySQL restore; 0 disables")
+	mysqlImage := fs.String("mysql-image", "", "override the MySQL/MariaDB sandbox image (default: mysql:<major.minor> or mariadb:<major.minor> of the dumped server)")
 	pgImage := fs.String("pg-image", "", "override the postgres sandbox image (default: postgres:<major of pg_dump>)")
 	dockerBin := fs.String("docker", "docker", "docker CLI binary")
 	endpoint := fs.String("endpoint", "", "S3-compatible endpoint URL (MinIO, B2, Wasabi, Ceph, …)")
@@ -151,8 +155,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return exitUsage
 	}
-	if *engineName != "auto" && *engineName != "postgres" {
-		fmt.Fprintf(stderr, "engine %q is not supported in this release (postgres only; MySQL is next)\n", *engineName)
+	if *engineName != "auto" && *engineName != "postgres" && *engineName != "mysql" {
+		fmt.Fprintf(stderr, "unknown --engine %q (auto, postgres or mysql)\n", *engineName)
 		return exitUsage
 	}
 	sinceDur, err := parseSince(*since)
@@ -236,9 +240,10 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(humanOut, "  removed %d expired sandbox container(s) from an earlier run\n", n)
 		}
 	}
-	eng := &postgres.Engine{
+	runID := randomID()
+	pg := &postgres.Engine{
 		Docker:    docker,
-		RunID:     randomID(),
+		RunID:     runID,
 		Image:     *pgImage,
 		Memory:    *memory,
 		CPUs:      *cpus,
@@ -246,6 +251,25 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		TTL:       *timeout + 15*time.Minute,
 
 		AmcheckBudget: *amcheck,
+	}
+	my := &mysqlengine.Engine{
+		Docker:      docker,
+		RunID:       runID,
+		Image:       *mysqlImage,
+		Memory:      *memory,
+		CPUs:        *cpus,
+		TmpfsSize:   *tmpfs,
+		TTL:         *timeout + 15*time.Minute,
+		CheckBudget: *amcheck,
+	}
+	var eng engine.Multi
+	switch *engineName {
+	case "postgres":
+		eng = engine.Multi{pg}
+	case "mysql":
+		eng = engine.Multi{my}
+	default:
+		eng = engine.Multi{pg, my}
 	}
 	v := &verify.Verifier{
 		Src:    src,

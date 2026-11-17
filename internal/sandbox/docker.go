@@ -94,6 +94,7 @@ type Spec struct {
 	TmpfsPath string // optional tmpfs mount point
 	TmpfsSize string // e.g. "1g"
 	CapAdd    []string
+	Args      []string // arguments after the image (the server's command-line options)
 }
 
 type Container struct {
@@ -139,6 +140,7 @@ func (d *Docker) Run(ctx context.Context, s Spec) (*Container, error) {
 		env = append(env, kv)
 	}
 	args = append(args, s.Image)
+	args = append(args, s.Args...)
 	d.log().Debug("sandbox start", "container", s.Name, "image", s.Image, "memory", s.Memory, "cpus", s.CPUs, "tmpfs", s.TmpfsSize)
 	if out, err := d.run(ctx, env, args...); err != nil {
 		d.log().Warn("sandbox start failed", "container", s.Name, "error", firstLine(out, err))
@@ -152,6 +154,7 @@ type ExecOpts struct {
 	Stdin  io.Reader
 	Stdout io.Writer // if nil, stdout is captured into ExecResult.Stdout (up to 64 MiB)
 	User   string
+	Env    []string // KEY=VALUE for this command only; values travel via the CLI's environment, never argv
 }
 
 type ExecResult struct {
@@ -176,10 +179,17 @@ func (c *Container) Exec(ctx context.Context, o ExecOpts) (ExecResult, error) {
 	if o.User != "" {
 		args = append(args, "-u", o.User)
 	}
+	for _, kv := range o.Env {
+		k, _, _ := strings.Cut(kv, "=")
+		args = append(args, "-e", k)
+	}
 	args = append(args, c.Name)
 	args = append(args, o.Args...)
 	cmd := exec.CommandContext(ctx, c.d.bin(), args...)
 	cmd.Stdin = o.Stdin
+	if len(o.Env) > 0 {
+		cmd.Env = append(os.Environ(), o.Env...)
+	}
 	stdout := &capBuffer{max: 64 << 20}
 	if o.Stdout != nil {
 		cmd.Stdout = o.Stdout

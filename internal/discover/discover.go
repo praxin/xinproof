@@ -46,6 +46,7 @@ type Detection struct {
 	Compression   Compression
 	Format        Format
 	Engine        string // "postgres", "mysql" or ""
+	Flavor        string // for mysql: "mysql" or "mariadb"
 	DumpVersion   string // version of the dump tool, e.g. "16.4"
 	ServerVersion string // version of the server it was dumped from
 	// Problem is set when the content is structurally broken in a way that
@@ -186,7 +187,8 @@ func SniffStream(r io.Reader) Detection {
 var (
 	rePGDumpVer   = regexp.MustCompile(`(?m)^-- Dumped by pg_dump(?:all)? version (\d+(?:\.\d+)*)`)
 	rePGServerVer = regexp.MustCompile(`(?m)^-- Dumped from database version (\d+(?:\.\d+)*)`)
-	reMySQLVer    = regexp.MustCompile(`(?m)^-- (?:MySQL|MariaDB) dump \S+\s+Distrib (\S+?),`)
+	// "-- MySQL dump 10.13  Distrib 8.0.36, for Linux" or "-- MariaDB dump 10.19-11.4.2-MariaDB, for debian-linux-gnu"
+	reMySQLVer    = regexp.MustCompile(`(?m)^-- (?:MySQL|MariaDB) dump \S+?(?:\s+Distrib (\S+?),|-(\S+?), for)`)
 	reMySQLServer = regexp.MustCompile(`(?m)^-- Server version\s+(\S+)`)
 )
 
@@ -248,13 +250,20 @@ func detectContent(d *Detection, b []byte) {
 		if m := rePGServerVer.FindStringSubmatch(text); m != nil {
 			d.ServerVersion = m[1]
 		}
-	case strings.Contains(text, "-- MySQL dump") || strings.Contains(text, "-- MariaDB dump"):
-		d.Format, d.Engine = FormatMySQL, "mysql"
+	case strings.Contains(text, "-- MySQL dump") || strings.Contains(text, "-- MariaDB dump"),
+		// mysqldump --skip-comments: no header, but always these session settings.
+		strings.HasPrefix(strings.TrimSpace(text), "/*!40101 SET @OLD_CHARACTER_SET_CLIENT") ||
+			strings.HasPrefix(strings.TrimSpace(text), "/*M!999999"): // MariaDB's sandbox-mode marker line
+		d.Format, d.Engine, d.Flavor = FormatMySQL, "mysql", "mysql"
 		if m := reMySQLVer.FindStringSubmatch(text); m != nil {
-			d.DumpVersion = m[1]
+			d.DumpVersion = m[1] + m[2]
 		}
 		if m := reMySQLServer.FindStringSubmatch(text); m != nil {
 			d.ServerVersion = m[1]
+		}
+		if strings.Contains(text, "-- MariaDB dump") || strings.Contains(d.DumpVersion+d.ServerVersion, "MariaDB") ||
+			strings.HasPrefix(strings.TrimSpace(text), "/*M!999999") {
+			d.Flavor = "mariadb"
 		}
 	default:
 		d.Format = FormatUnknown

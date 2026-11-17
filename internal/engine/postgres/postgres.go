@@ -129,6 +129,8 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 		PidsLimit: 512,
 		// Enough for the image entrypoint to initdb and drop to the postgres user.
 		CapAdd: []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"},
+		// The sandbox is thrown away, so durability is off: restores run much faster.
+		Args: []string{"-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"},
 	}
 	if e.TmpfsSize != "" {
 		spec.TmpfsPath, spec.TmpfsSize = "/xinproof", e.TmpfsSize
@@ -332,8 +334,8 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	}
 	out.Tables = len(tables)
 	for _, t := range tables {
-		if t.kind == 'r' {
-			out.Rows += t.rows
+		if t.Kind == 'r' {
+			out.Rows += t.Rows
 		}
 	}
 	out.RowsKnown = true
@@ -350,11 +352,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	}
 
 	if problems := AuditRows(dumpRows, tables); len(problems) > 0 {
-		reason := strings.Join(problems[:min(3, len(problems))], "; ")
-		if len(problems) > 3 {
-			reason += fmt.Sprintf("; and %d more", len(problems)-3)
-		}
-		return failOut("l2.rows", "restored data doesn't match the dump: "+reason)
+		return failOut("l2.rows", "restored data doesn't match the dump: "+engine.SummarizeProblems(problems))
 	}
 	withData := 0
 	for _, n := range dumpRows {
@@ -391,47 +389,6 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 
 	out.Result = receipt.Pass
 	return out
-}
-
-// TableCount is one restored table.
-type TableCount struct {
-	DB, Qualified string // DB "" is the database the dump was restored into
-	kind          byte   // 'r' table, 'p' partitioned parent
-	rows          int64
-}
-
-func NewTableCount(db, qualified string, kind byte, rows int64) TableCount {
-	return TableCount{DB: db, Qualified: qualified, kind: kind, rows: rows}
-}
-
-// AuditRows compares the rows each table holds in the dump with what was
-// restored and describes every table that lost rows.
-func AuditRows(dump map[string]int64, restored []TableCount) []string {
-	have := map[string]int64{}
-	for _, t := range restored {
-		have[TableKey(t.DB, t.Qualified)] = t.rows
-	}
-	keys := make([]string, 0, len(dump))
-	for k := range dump {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var problems []string
-	for _, k := range keys {
-		want := dump[k]
-		db, name := SplitTableKey(k)
-		if db != "" {
-			name = db + ":" + name
-		}
-		got, ok := have[k]
-		switch {
-		case !ok && want > 0:
-			problems = append(problems, fmt.Sprintf("%s has %d rows in the dump but is missing after restore", name, want))
-		case ok && got < want:
-			problems = append(problems, fmt.Sprintf("%s has %d rows in the dump, %d restored (−%d)", name, want, got, want-got))
-		}
-	}
-	return problems
 }
 
 const userSchemas = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%' AND n.nspname <> 'xinproof_amcheck'`
@@ -483,7 +440,7 @@ func (s *session) inspect(ctx context.Context) (dbs []string, tables []TableCoun
 			if err != nil {
 				return nil, nil, fmt.Errorf("unexpected inspection output %q", line)
 			}
-			tables = append(tables, TableCount{DB: key, Qualified: f[0] + "." + f[1], kind: f[2][0], rows: n})
+			tables = append(tables, TableCount{DB: key, Qualified: f[0] + "." + f[1], Kind: f[2][0], Rows: n})
 		}
 	}
 	return dbs, tables, nil

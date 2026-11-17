@@ -30,7 +30,7 @@ A receipt is a JSON document that records what xinproof did to one backup and wh
 | `chain.prev` | string | `sha256:<hex>` of the previous receipt (see §3). For seq 1 it is `sha256:` followed by 64 zeros. |
 | `signature` | object | See §2. |
 
-Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck`. New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
+Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck` (Postgres), `l2.check_table` (MySQL/MariaDB). New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
 
 **Privacy:** receipts never contain row data. They contain counts, hashes, versions and the backup's location.
 

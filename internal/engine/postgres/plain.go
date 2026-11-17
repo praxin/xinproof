@@ -39,16 +39,6 @@ func NewPlainAnalyzer() *PlainAnalyzer {
 	return &PlainAnalyzer{referenced: map[string]bool{}, created: map[string]bool{}, Rows: map[string]int64{}}
 }
 
-// TableKey identifies a table across databases. db "" is the database the
-// dump was restored into (no \connect).
-func TableKey(db, qualified string) string { return db + "\x00" + qualified }
-
-// SplitTableKey is the inverse of TableKey.
-func SplitTableKey(k string) (db, qualified string) {
-	db, qualified, _ = strings.Cut(k, "\x00")
-	return db, qualified
-}
-
 func (a *PlainAnalyzer) Write(p []byte) (int, error) {
 	n := len(p)
 	a.bytes += int64(n)

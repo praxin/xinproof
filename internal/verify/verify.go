@@ -581,10 +581,7 @@ func firstErr(errs ...error) error {
 }
 
 func unsupported(det discover.Detection) string {
-	if det.Format == discover.FormatMySQL {
-		return "MySQL dumps are recognized but the MySQL engine isn't in this release yet, so nothing was restored"
-	}
-	return fmt.Sprintf("no engine for format %s", det.Format)
+	return fmt.Sprintf("no enabled engine restores %s dumps (see --engine), so nothing was restored", det.Format)
 }
 
 func describe(det discover.Detection) string {

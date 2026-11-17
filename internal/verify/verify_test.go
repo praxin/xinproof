@@ -158,7 +158,7 @@ func TestContract(t *testing.T) {
 		{name: "truncated header", file: "pg_hdr.dump", content: custom[:20], eng: &fakeEngine{outcome: passOutcome}, want: receipt.Fail, reason: "truncated"},
 		{name: "restore fails in sandbox", file: "pg_bad.dump", content: custom, eng: &fakeEngine{outcome: engine.Outcome{Result: receipt.Fail, Reason: "pg_restore failed (exit 1): could not read from input file"}}, want: receipt.Fail, reason: "pg_restore failed"},
 		{name: "docker missing on a good dump", file: "pg_good.dump", content: custom, eng: &fakeEngine{startErr: errors.New("docker is not available")}, want: receipt.Error, reason: "docker is not available"},
-		{name: "mysql recognized but unsupported", file: "shop.sql", content: []byte("-- MySQL dump 10.13  Distrib 8.0.36, for Linux\n"), eng: &fakeEngine{outcome: passOutcome}, want: receipt.Error, reason: "MySQL"},
+		{name: "format with no enabled engine", file: "shop.sql", content: []byte("-- MySQL dump 10.13  Distrib 8.0.36, for Linux\n"), eng: &fakeEngine{outcome: passOutcome}, want: receipt.Error, reason: "no enabled engine restores mysql-plain"},
 		{name: "sidecar matches", file: "pg_side.dump", content: custom, sidecar: sha(custom) + "  pg_side.dump\n", eng: &fakeEngine{outcome: passOutcome}, want: receipt.Pass},
 		{name: "sidecar mismatch", file: "pg_side.dump", content: custom, sidecar: strings.Repeat("0", 64) + "\n", eng: &fakeEngine{outcome: passOutcome}, want: receipt.Fail, reason: "checksum mismatch"},
 		{name: "engine returns nothing", file: "pg_good.dump", content: custom, eng: &fakeEngine{}, want: receipt.Error, reason: "no result"},
