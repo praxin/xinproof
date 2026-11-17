@@ -1,0 +1,6 @@
+bin/
+receipts/
+test-dumps/
+.git/
+*.dump
+*.sql.gz

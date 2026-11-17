@@ -1,0 +1,164 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      # go.mod/go.sum must already be tidy; the tidied files are uploaded either
+      # way so a fix can be committed from machines that can't run Go.
+      - name: go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Upload go.mod / go.sum
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-modules
+          path: |
+            go.mod
+            go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Cross-build (linux, macOS, windows)
+        if: success() || failure()
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "== $t"; GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/xinproof
+          done
+
+      # The golden v1 receipt pins the receipt format. Generated once, then committed.
+      - name: Golden receipt (generate if missing)
+        if: success() || failure()
+        run: |
+          if [ ! -f internal/receipt/testdata/receipt-v1.json ]; then
+            XINPROOF_UPDATE_GOLDEN=1 go test -count=1 -run TestGoldenReceipt ./internal/receipt
+            echo "::warning::golden receipt was generated in CI; commit internal/receipt/testdata"
+          fi
+
+      - name: Upload golden receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-testdata
+          path: internal/receipt/testdata
+          if-no-files-found: ignore
+
+      - name: Vet
+        if: success() || failure()
+        run: go vet ./...
+
+      - name: gofmt
+        if: success() || failure()
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "needs gofmt:"; echo "$out"; gofmt -d .; exit 1; fi
+
+      - name: Unit tests (race)
+        if: success() || failure()
+        run: go test -race -short -count=1 ./...
+
+      - name: Integration tests (real Postgres and MySQL in Docker)
+        if: success() || failure()
+        run: go test -count=1 -v -run 'TestReal|Extension' ./internal/engine/postgres/ ./internal/engine/mysql/
+
+      - name: Storage backends against emulators (SeaweedFS S3, Azurite, fake-gcs-server)
+        if: success() || failure()
+        run: go test -count=1 -v -run 'Conformance|EndToEnd|AzureErrors' ./internal/source/... ./internal/verify/
+
+      # Real AWS, no credentials: a public AWS Open Data bucket in eu-central-1
+      # (region auto-detected). Real-account tests with read-only identities
+      # live in real-cloud.yml.
+      - name: Real AWS (public bucket, unsigned)
+        if: success() || failure()
+        env:
+          XINPROOF_REAL_AWS: "1"
+        run: go test -count=1 -v -run RealAWS ./internal/source/s3/
+
+      - name: Chaos tests (killed sandbox, blown budget, full disk, SIGKILL, Ctrl-C)
+        if: success() || failure()
+        run: go test -count=1 -v -timeout 20m ./internal/chaos/
+
+      - name: Demo (one good, one truncated dump)
+        if: success() || failure()
+        env:
+          WORK: ${{ runner.temp }}/demo
+        run: bash scripts/demo.sh
+
+      - name: JSON and JUnit reports
+        if: success() || failure()
+        env:
+          WORK: ${{ runner.temp }}/demo
+          XINPROOF_HOME: ${{ runner.temp }}/demo/home
+        run: |
+          set +e
+          ./bin/xinproof verify --format json --receipts "$WORK/receipts" "$WORK/dumps" > "$WORK/report.json"
+          code=$?
+          ./bin/xinproof verify --format junit --output "$WORK/report.xml" --receipts "$WORK/receipts" "$WORK/dumps"
+          set -e
+          test "$code" = 1
+          jq -e '.summary == {"total":2,"pass":1,"fail":1,"error":0} and .exit_code == 1' "$WORK/report.json"
+          grep -q 'failures="1"' "$WORK/report.xml"
+          ./bin/xinproof receipt verify "$WORK"/receipts/receipt-*.json
+
+      - name: govulncheck
+        if: success() || failure()
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Every supported PostgreSQL major: dump in every format, corrupt it, and
+  # check that clean dumps PASS and corrupted ones FAIL.
+  postgres-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["13", "14", "15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Integration tests against postgres:${{ matrix.pg }}
+        env:
+          XINPROOF_TEST_PG_IMAGE: postgres:${{ matrix.pg }}
+        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/
+
+  # MySQL and MariaDB: real mysqldump / mariadb-dump output, clean and corrupted.
+  mysql-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mysql:8.0", "mysql:8.4", "mariadb:10.11", "mariadb:11.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Integration tests against ${{ matrix.image }}
+        env:
+          XINPROOF_TEST_MYSQL_IMAGE: ${{ matrix.image }}
+        run: go test -count=1 -v -timeout 25m -run 'TestReal' ./internal/engine/mysql/

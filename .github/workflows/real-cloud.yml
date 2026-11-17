@@ -1,0 +1,88 @@
+# Verifies real backups in real cloud accounts with the same login methods
+# customers use. Each cloud has a private bucket holding the same three test
+# dumps (two good, one truncated) and a read-only identity:
+#   AWS S3         read-only IAM user (access key in secrets)
+#   Azure Blob     GitHub OIDC -> Entra app with Storage Blob Data Reader
+#   Google Cloud   GitHub OIDC -> workload identity -> objectViewer on one bucket
+#   Cloudflare R2  read-only R2 token scoped to one bucket (in secrets)
+# A cloud whose secrets/variables aren't set is skipped, not failed.
+name: real-cloud
+
+on:
+  push:
+    branches: [main, feat/verifier-mvp]
+  schedule:
+    - cron: "17 3 * * *" # nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # Azure and Google Cloud sign-in without a stored secret
+
+concurrency:
+  group: real-cloud-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HAS_AWS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && vars.AWS_TEST_LOCATION != '' }}
+      HAS_AZURE: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TEST_LOCATION != '' }}
+      HAS_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' && vars.R2_ACCOUNT_ID != '' }}
+      HAS_GCP: ${{ vars.GCP_WIF_PROVIDER != '' && vars.GCP_TEST_LOCATION != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build -o xinproof ./cmd/xinproof
+      - name: Pull sandbox images
+        run: docker pull -q postgres:16 && docker pull -q mysql:8.0
+
+      # Each cloud runs even if another one failed (!cancelled()), so one
+      # broken login doesn't hide the other results.
+      - name: AWS S3 (read-only IAM user)
+        if: ${{ !cancelled() && env.HAS_AWS == 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: bash scripts/real-cloud.sh "${{ vars.AWS_TEST_LOCATION }}"
+
+      - name: Azure sign-in (GitHub OIDC, no stored secret)
+        id: azlogin
+        if: ${{ !cancelled() && env.HAS_AZURE == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Blob (Storage Blob Data Reader, via the az login above)
+        if: ${{ !cancelled() && steps.azlogin.outcome == 'success' }}
+        run: bash scripts/real-cloud.sh "${{ vars.AZURE_TEST_LOCATION }}"
+
+      - name: Google Cloud sign-in (workload identity federation, no stored secret)
+        id: gcplogin
+        if: ${{ !cancelled() && env.HAS_GCP == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Google Cloud Storage (objectViewer on one bucket, via the sign-in above)
+        if: ${{ !cancelled() && steps.gcplogin.outcome == 'success' }}
+        run: bash scripts/real-cloud.sh "${{ vars.GCP_TEST_LOCATION }}"
+
+      - name: Cloudflare R2 (read-only token, one bucket)
+        if: ${{ !cancelled() && env.HAS_R2 == 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: bash scripts/real-cloud.sh "${{ vars.R2_TEST_LOCATION }}" --r2-account-id "${{ vars.R2_ACCOUNT_ID }}"
+
+      - name: Clouds skipped (missing secrets or variables)
+        if: ${{ !cancelled() && (env.HAS_AWS != 'true' || env.HAS_AZURE != 'true' || env.HAS_GCP != 'true' || env.HAS_R2 != 'true') }}
+        run: |
+          echo "AWS: $HAS_AWS  Azure: $HAS_AZURE  GCP: $HAS_GCP  R2: $HAS_R2"
+          echo "::notice::Some real-cloud checks were skipped because their secrets or variables aren't set."

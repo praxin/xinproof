@@ -1,0 +1,28 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Local xinproof state (keys and receipts must never be committed)
+.xinproof/
+receipts/
+*.key
+*.pem
+
+# Test fixtures generated at runtime
+/testdata/generated/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

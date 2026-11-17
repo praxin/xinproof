@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.dump binary
+*.gz binary
+internal/receipt/testdata/* -text

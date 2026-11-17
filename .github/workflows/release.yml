@@ -1,0 +1,90 @@
+# Release: push a tag like v0.1.0. Builds Linux and macOS binaries (amd64 and
+# arm64), SHA-256 checksums, a GitHub Release, and a multi-arch image at
+# ghcr.io/praxin/xinproof. Running it by hand (workflow_dispatch) or on a pull
+# request that changes the release files is a dry run: everything is built and
+# smoke-tested, nothing is published.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request: # dry run when the release itself changes
+    paths: [".github/workflows/release.yml", "Dockerfile", ".dockerignore", "go.mod", "go.sum"]
+
+permissions:
+  contents: write  # create the GitHub Release
+  packages: write  # push to ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; publish=true
+          else v="0.0.0-dryrun.$(git rev-parse --short HEAD)"; publish=false; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"; echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version $v, publish $publish"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}; arch=${target#*/}
+            name="xinproof_${VERSION}_${os}_${arch}"
+            mkdir -p "build/$name"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" -o "build/$name/xinproof" ./cmd/xinproof
+            cp LICENSE README.md "build/$name/"
+            tar -C build -czf "dist/$name.tar.gz" "$name"
+          done
+          (cd dist && sha256sum *.tar.gz > checksums.txt && cat checksums.txt)
+
+      - name: Smoke test the Linux binary
+        run: |
+          tar -xzf dist/xinproof_*_linux_amd64.tar.gz -C /tmp
+          /tmp/xinproof_*_linux_amd64/xinproof version | tee /dev/stderr | grep -q "${{ steps.v.outputs.version }}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io
+        if: steps.v.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and on a tag, push) the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.v.outputs.version }}
+          push: ${{ steps.v.outputs.publish == 'true' }}
+          tags: |
+            ghcr.io/praxin/xinproof:${{ steps.v.outputs.version }}
+            ghcr.io/praxin/xinproof:latest
+
+      - name: Publish the GitHub Release
+        if: steps.v.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --generate-notes --title "xinproof $GITHUB_REF_NAME"
+
+      - name: Dry-run artifacts
+        if: steps.v.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinproof-dryrun
+          path: dist/
+          retention-days: 3
