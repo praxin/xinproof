@@ -13,7 +13,7 @@ loc=$1; shift
 bin=${XINPROOF_BIN:-./xinproof}
 out=$(mktemp)
 code=0
-"$bin" verify "$loc" --format json --output "$out" --receipts "$(mktemp -d)" "$@" || code=$?
+"$bin" verify "$loc" --format json --output "$out" --receipts "${XINPROOF_RECEIPTS:-$(mktemp -d)}" "$@" || code=$?
 python3 - "$out" "$code" "$loc" <<'PY'
 import json, sys
 path, code, loc = sys.argv[1], int(sys.argv[2]), sys.argv[3]
