@@ -46,6 +46,9 @@ GRANT SELECT ON orders TO app_reader;
 
 const fixtureTables, fixtureRows = 3, 65000
 
+// fixtureTableCounts is the receipt's "tables" for the fixture, as fmt prints it.
+const fixtureTableCounts = "[{public.audit_log 20000} {public.customers 5000} {public.orders 40000}]"
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
@@ -282,6 +285,9 @@ func TestRealRestores(t *testing.T) {
 				if status[id] != receipt.CheckPass {
 					t.Errorf("%s: check %s = %q, want pass", r.Object.Name, id, status[id])
 				}
+			}
+			if got := fmt.Sprint(r.Receipt.Tables); got != fixtureTableCounts {
+				t.Errorf("%s: receipt tables %s, want %s", r.Object.Name, got, fixtureTableCounts)
 			}
 		}
 		doc, err := os.ReadFile(r.ReceiptPath)

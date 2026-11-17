@@ -2,3 +2,4 @@
 *.dump binary
 *.gz binary
 internal/receipt/testdata/* -text
+*.archive binary

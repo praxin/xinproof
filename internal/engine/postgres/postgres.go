@@ -387,6 +387,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 		return execErr(err, "inspecting the restored database")
 	}
 	out.Tables = len(tables)
+	out.TableCounts = tables
 	for _, t := range tables {
 		if t.Kind == 'r' {
 			out.Rows += t.Rows

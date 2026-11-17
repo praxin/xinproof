@@ -35,6 +35,9 @@ type Options struct {
 	ToolCommit  string
 	Now         func() time.Time
 	Log         *slog.Logger // structured logs; nil discards
+	// Checks are user-defined SQL checks run in the sandbox after a
+	// successful restore (--check); a failing one fails the backup.
+	Checks []CustomCheck
 
 	// OnPlan is called once the candidates are known; OnStart before and
 	// OnResult after each backup is processed.
@@ -394,6 +397,7 @@ func (v *Verifier) one(parent context.Context, u unit) (res Result) {
 		d.out = errorOutcome("engine returned no result")
 	}
 	d.checks = append(d.checks, d.out.Checks...)
+	v.runCustomChecks(ctx, sess, d)
 	return
 }
 
@@ -500,6 +504,7 @@ func (v *Verifier) oneDir(ctx context.Context, d *draft, u unit, budget func(err
 		d.out = errorOutcome("engine returned no result")
 	}
 	d.checks = append(d.checks, d.out.Checks...)
+	v.runCustomChecks(ctx, sess, d)
 }
 
 // streamMember reads one file of a directory dump, adds it to the tar (if
@@ -709,7 +714,14 @@ func (v *Verifier) build(d *draft, total time.Duration) *receipt.Receipt {
 	r.Result, r.Reason = d.out.Result, d.out.Reason
 	r.Measured = receipt.Measured{RestoreSeconds: d.out.RestoreSeconds, TotalSeconds: engine.Seconds(total)}
 	if d.checks != nil {
-		r.Checks = d.checks
+		r.Checks = append([]receipt.Check(nil), d.checks...)
+	}
+	if tables, total := engine.ReceiptTables(d.out.TableCounts); len(tables) > 0 {
+		r.Tables = tables
+		if total > len(tables) {
+			r.Checks = append(r.Checks, receipt.Check{ID: "l2.tables", Status: receipt.CheckInfo,
+				Detail: fmt.Sprintf("tables list capped: first %d of %d tables by name", len(tables), total)})
+		}
 	}
 	r.Tool = receipt.Tool{Name: "xinproof", Version: v.Opts.ToolVersion, Commit: v.Opts.ToolCommit}
 	return r

@@ -40,12 +40,15 @@ const (
 	FormatPGTar    Format = "postgres-tar"       // pg_dump -Ft
 	FormatPGDir    Format = "postgres-directory" // pg_dump -Fd (a folder holding toc.dat and data files)
 	FormatMySQL    Format = "mysql-plain"        // mysqldump / mariadb-dump
+	// FormatMongoArchive is mongodump --archive output (optionally --gzip,
+	// which compresses the whole stream).
+	FormatMongoArchive Format = "mongodb-archive"
 )
 
 type Detection struct {
 	Compression   Compression
 	Format        Format
-	Engine        string // "postgres", "mysql" or ""
+	Engine        string // "postgres", "mysql", "mongodb" or ""
 	Flavor        string // for mysql: "mysql" or "mariadb"
 	DumpVersion   string // version of the dump tool, e.g. "16.4"
 	ServerVersion string // version of the server it was dumped from
@@ -58,6 +61,7 @@ type Detection struct {
 var candidateExt = map[string]bool{
 	".dump": true, ".backup": true, ".bak": true, ".pgdump": true, ".pg_dump": true,
 	".sql": true, ".psql": true, ".pgsql": true, ".dmp": true,
+	".archive": true, // mongodump --archive=<file>
 }
 
 var compressionExt = map[string]bool{".gz": true, ".gzip": true, ".zst": true, ".zstd": true, ".lz4": true}
@@ -219,6 +223,10 @@ func detectContent(d *Detection, b []byte) {
 		d.DumpVersion, d.ServerVersion = firstWord(h.DumpVersion), firstWord(h.ServerVersion)
 		return
 	}
+	if bytes.HasPrefix(b, MongoArchiveMagic) {
+		detectMongoArchive(d, b)
+		return
+	}
 	if bytes.HasPrefix(b, []byte("PGDMP")) {
 		d.Format, d.Engine = FormatPGCustom, "postgres"
 		h, err := ParsePGDMP(b)
@@ -267,7 +275,7 @@ func detectContent(d *Detection, b []byte) {
 		}
 	default:
 		d.Format = FormatUnknown
-		d.Problem = fmt.Sprintf("not a recognizable PostgreSQL or MySQL dump (starts with %q)", preview(b))
+		d.Problem = fmt.Sprintf("not a recognizable PostgreSQL, MySQL or MongoDB dump (starts with %q)", preview(b))
 	}
 }
 

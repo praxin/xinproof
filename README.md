@@ -20,19 +20,20 @@ $ xinproof receipt verify receipts/*.json
 ✓ receipt-000002.json  signature valid (pinned: this machine's key) · chain intact
 ```
 
-Status: pre-release (0.1.0). PostgreSQL (13–18) and MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4), from local folders, AWS S3, S3-compatible stores, Cloudflare R2, Azure Blob Storage / ADLS Gen2 and Google Cloud Storage. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
+Status: pre-release (0.1.0). PostgreSQL (13–18), MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4) and MongoDB (`mongodump --archive` from MongoDB 6.0, 7, 8.0), from local folders, AWS S3, S3-compatible stores, Cloudflare R2, Azure Blob Storage / ADLS Gen2 and Google Cloud Storage. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
 
 ## What it does
-1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: every `pg_dump` format — custom (`-Fc`, including gzip/lz4/zstd compression inside), tar (`-Ft`), directory (`-Fd`, a folder holding `toc.dat`, treated as one backup) — and plain SQL from `pg_dump`/`pg_dumpall`; `mysqldump` and `mariadb-dump` output (with or without comments, extended or one-row inserts, single or `--databases`); whole files may also be gzip/zstd/lz4 compressed. Tarballs that aren't pg_dump archives are skipped.
-2. **Checks integrity** (L1): SHA-256 of the whole object (for a directory dump, of the per-file manifest), compared with a `<file>.sha256` sidecar or the S3 `ChecksumSHA256` when present; full decompression of the object and of every compressed data file; plain dumps must end with pg_dump's "dump complete" trailer and must not stop inside table data; tar archives must be complete, with their end-of-archive marker (`pg_restore` restores a truncated tar archive without complaint, so this matters); MySQL dumps must not stop inside an `INSERT` and must end with mysqldump's `-- Dump completed` line.
-3. **Restores** (L2) each backup into a fresh container matching the version that made it — `postgres:<major>`, `mysql:<major.minor>` or `mariadb:<major.minor>`: **no network**, memory/CPU/PID limits, all capabilities dropped except the few the image needs, `no-new-privileges`, durability off (the sandbox is thrown away). `pg_restore --exit-on-error`, `psql -v ON_ERROR_STOP=1`, or the `mysql`/`mariadb` client, which stops at the first error.
+1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: every `pg_dump` format — custom (`-Fc`, including gzip/lz4/zstd compression inside), tar (`-Ft`), directory (`-Fd`, a folder holding `toc.dat`, treated as one backup) — and plain SQL from `pg_dump`/`pg_dumpall`; `mysqldump` and `mariadb-dump` output (with or without comments, extended or one-row inserts, single or `--databases`); `mongodump --archive=<file>.archive` output (also with `--gzip`, which compresses the whole archive); whole files may also be gzip/zstd/lz4 compressed. Tarballs that aren't pg_dump archives are skipped.
+2. **Checks integrity** (L1): SHA-256 of the whole object (for a directory dump, of the per-file manifest), compared with a `<file>.sha256` sidecar or the S3 `ChecksumSHA256` when present; full decompression of the object and of every compressed data file; plain dumps must end with pg_dump's "dump complete" trailer and must not stop inside table data; tar archives must be complete, with their end-of-archive marker (`pg_restore` restores a truncated tar archive without complaint, so this matters); MySQL dumps must not stop inside an `INSERT` and must end with mysqldump's `-- Dump completed` line; MongoDB archives must close every namespace they declare, and each namespace's data must match the CRC-64 the archive records for it (`mongorestore` reports a CRC mismatch but still exits 0, so this matters).
+3. **Restores** (L2) each backup into a fresh container matching the version that made it — `postgres:<major>`, `mysql:<major.minor>` or `mariadb:<major.minor>` (MongoDB: `mongo:7`, or `--mongo-image`): **no network**, memory/CPU/PID limits, all capabilities dropped except the few the image needs, `no-new-privileges`, durability off (the sandbox is thrown away). `pg_restore --exit-on-error`, `psql -v ON_ERROR_STOP=1`, or the `mysql`/`mariadb` client, which stops at the first error; `mongorestore --stopOnError`.
 4. **Checks the result**:
    - tables restored vs. the dump's table of contents;
-   - **row audit**: the exact row count of every table is compared with the rows the dump holds for it — any table that lost rows is a FAIL;
-   - **index integrity**: Postgres `amcheck` (`bt_index_check` with `heapallindexed`) on every B-tree index, largest first; MySQL `CHECK TABLE` on every table; both within `--amcheck-budget`;
-   - **schema hash**: a SHA-256 fingerprint of columns, types, constraints and indexes, identical for the same database whatever the dump format;
+   - **row audit**: the exact row count of every table (MongoDB: document count of every collection) is compared with the rows the dump holds for it — any table that lost rows is a FAIL;
+   - **index integrity**: Postgres `amcheck` (`bt_index_check` with `heapallindexed`) on every B-tree index, largest first; MySQL `CHECK TABLE` on every table; both within `--amcheck-budget` (not for MongoDB);
+   - **schema hash**: a SHA-256 fingerprint of columns, types, constraints and indexes, identical for the same database whatever the dump format (Postgres and MySQL);
+   - **your own checks** (`--check 'name=SQL'`, Postgres and MySQL), see [Custom checks](#custom-checks);
    - restore duration (the measured RTO).
-5. **Signs a receipt** for every backup: Ed25519 over the RFC 8785 canonical JSON, hash-chained to the previous receipt.
+5. **Signs a receipt** for every backup, listing every restored table with its exact row count (names and counts only, never row data): Ed25519 over the RFC 8785 canonical JSON, hash-chained to the previous receipt.
 
 Every backup ends in exactly one of **PASS**, **FAIL** (it won't restore, with the reason) or **ERROR** (it couldn't be tested, with the reason). Nothing is silently skipped.
 
@@ -107,15 +108,32 @@ Provider checksums are checked during L1 when the store has them: S3 `ChecksumSH
 | `--timeout` | `2h` | per-backup budget; exceeding it is an ERROR |
 | `--memory`, `--cpus` | `2g`, `2` | sandbox limits |
 | `--tmpfs SIZE` | off | keep the dump and restored data in RAM instead of the container's disk |
-| `--engine` | `auto` | `postgres` or `mysql` to restrict which dumps are tested |
-| `--pg-image`, `--mysql-image` | matched to the dump | override the sandbox image |
+| `--engine` | `auto` | `postgres`, `mysql` or `mongodb` to restrict which dumps are tested |
+| `--pg-image`, `--mysql-image`, `--mongo-image` | matched to the dump (`mongo:7` for MongoDB) | override the sandbox image |
 | `--amcheck-budget` | `10m` | time budget for index verification (amcheck / CHECK TABLE); `0` disables it |
+| `--check 'name=SQL'` | | custom check, repeatable; see [Custom checks](#custom-checks) |
 | `--endpoint`, `--region`, `--profile`, `--path-style`, `--r2-account-id` | | storage options; on AWS the bucket's region is detected when `--region` is unset |
 | `--no-sign-request` | | S3: unsigned requests, for public buckets |
 | `--format` | `human` | `json` (schema `xinproof.report/v1`) or `junit` for CI; the report goes to stdout and human progress to stderr |
 | `--output FILE` | | write the json/junit report to a file and keep human output on stdout |
 | `--log-level`, `--log-format` | `warn`, `text` | structured logs on stderr (`debug`/`info`/`warn`/`error`/`off`; `text` or `json`) |
 | `--no-color` | | also honors `NO_COLOR` |
+
+### Custom checks
+A backup can restore cleanly and still be wrong: last night's orders missing, a table emptied by a bad migration. `--check 'name=SQL'` (repeatable) runs your own query in the sandbox after a successful restore:
+
+```bash
+xinproof verify \
+  --check 'orders_recent=SELECT count(*) > 0 FROM orders WHERE created_at > now() - interval '"'"'1 day'"'"'' \
+  --check 'no_orphans=SELECT NOT EXISTS (SELECT 1 FROM orders o LEFT JOIN customers c ON c.id = o.customer_id WHERE c.id IS NULL)' \
+  s3://acme-backups/postgres/
+```
+
+- The query runs in the database the dump was restored into (MySQL: qualify other databases' tables, e.g. `shop.orders`). It must return **one row with one column**.
+- It passes if the value is truthy: boolean true, a non-zero number, or a non-empty string other than `0`, `f` or `false`. NULL, zero, false, an empty string, the wrong number of rows or columns, or a SQL error fail it — and a failing check makes the backup **FAIL** with `custom check "<name>" failed: …`.
+- Each check is recorded in the receipt as an `l3.custom` check with detail `<name>: <value or error>` (at most 200 characters). Return booleans or counts, not data: the value ends up in the receipt.
+- Names are 1–64 characters of `A–Z a–z 0–9 _ . -`. Checks are skipped (recorded as `skip`) when the restore did not pass, and for MongoDB backups (no SQL).
+- The sandbox is thrown away afterwards, so a check can't harm anything; it runs within the backup's `--timeout`.
 
 Interrupting a run (Ctrl-C, SIGTERM) stops the current restore, removes its sandbox, and reports every backup not yet tested as ERROR, each with a receipt.
 

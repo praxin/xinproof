@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/praxin/xinproof/internal/engine"
+	mongoengine "github.com/praxin/xinproof/internal/engine/mongodb"
 	mysqlengine "github.com/praxin/xinproof/internal/engine/mysql"
 	"github.com/praxin/xinproof/internal/engine/postgres"
 	"github.com/praxin/xinproof/internal/receipt"
@@ -61,7 +62,8 @@ Usage:
 Locations:
   ./dumps/  /mnt/backups/pg.dump            local folder (recursive) or one file
                                             (pg_dump custom, tar, directory and plain SQL;
-                                             mysqldump / mariadb-dump; optionally gzip/zstd/lz4)
+                                             mysqldump / mariadb-dump; mongodump --archive;
+                                             optionally gzip/zstd/lz4)
   s3://bucket/prefix/                       AWS S3 (standard AWS credential chain)
   s3://bucket/prefix/ --endpoint URL        any S3-compatible store (MinIO, B2, Wasabi, …)
   r2://bucket/prefix/                       Cloudflare R2 (needs --r2-account-id or R2_ACCOUNT_ID)
@@ -126,7 +128,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	since := fs.String("since", "", "only backups modified within this window, e.g. 7d or 36h")
 	newest := fs.Int("newest", 0, "only test the newest N backups (0 = all)")
-	engineName := fs.String("engine", "auto", "database engines to use: auto (all), postgres or mysql")
+	engineName := fs.String("engine", "auto", "database engines to use: auto (all), postgres, mysql or mongodb")
 	receiptsDir := fs.String("receipts", "receipts", "directory for signed receipts (hash-chained)")
 	timeout := fs.Duration("timeout", 2*time.Hour, "per-backup time budget")
 	memory := fs.String("memory", "2g", "sandbox memory limit")
@@ -135,6 +137,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	amcheck := fs.Duration("amcheck-budget", 10*time.Minute, "time budget for index verification: amcheck per Postgres database, CHECK TABLE per MySQL restore; 0 disables")
 	mysqlImage := fs.String("mysql-image", "", "override the MySQL/MariaDB sandbox image (default: mysql:<major.minor> or mariadb:<major.minor> of the dumped server)")
 	pgImage := fs.String("pg-image", "", "override the postgres sandbox image (default: postgres:<major of pg_dump>)")
+	mongoImage := fs.String("mongo-image", "", "override the MongoDB sandbox image (default: "+mongoengine.DefaultImage+")")
 	dockerBin := fs.String("docker", "docker", "docker CLI binary")
 	endpoint := fs.String("endpoint", "", "custom storage endpoint: S3-compatible stores (B2, Wasabi, Ceph, SeaweedFS, …), Azurite, fake-gcs-server")
 	region := fs.String("region", "", "S3 region (default: detected from the bucket on AWS)")
@@ -147,6 +150,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	output := fs.String("output", "", "write the json/junit report to this file (human output stays on stdout)")
 	logLevel := fs.String("log-level", "warn", "structured log level on stderr: debug, info, warn, error, off")
 	logFormat := fs.String("log-format", "text", "structured log format: text or json")
+	var checks customChecks
+	fs.Var(&checks, "check", "custom check `name=SQL`, repeatable: after a successful restore, run SQL in the restored database; it must return one row with one truthy value, or the backup FAILs")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: xinproof verify [flags] <location>")
 		fs.PrintDefaults()
@@ -162,8 +167,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return exitUsage
 	}
-	if *engineName != "auto" && *engineName != "postgres" && *engineName != "mysql" {
-		fmt.Fprintf(stderr, "unknown --engine %q (auto, postgres or mysql)\n", *engineName)
+	if *engineName != "auto" && *engineName != "postgres" && *engineName != "mysql" && *engineName != "mongodb" {
+		fmt.Fprintf(stderr, "unknown --engine %q (auto, postgres, mysql or mongodb)\n", *engineName)
 		return exitUsage
 	}
 	sinceDur, err := parseSince(*since)
@@ -269,14 +274,25 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		TTL:         *timeout + 15*time.Minute,
 		CheckBudget: *amcheck,
 	}
+	mg := &mongoengine.Engine{
+		Docker:    docker,
+		RunID:     runID,
+		Image:     *mongoImage,
+		Memory:    *memory,
+		CPUs:      *cpus,
+		TmpfsSize: *tmpfs,
+		TTL:       *timeout + 15*time.Minute,
+	}
 	var eng engine.Multi
 	switch *engineName {
 	case "postgres":
 		eng = engine.Multi{pg}
 	case "mysql":
 		eng = engine.Multi{my}
+	case "mongodb":
+		eng = engine.Multi{mg}
 	default:
-		eng = engine.Multi{pg, my}
+		eng = engine.Multi{pg, my, mg}
 	}
 	v := &verify.Verifier{
 		Src:    src,
@@ -293,11 +309,12 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 			OnStart:     func(o source.Object) { h.Start(o.Name) },
 			OnResult:    h.Result,
 			Log:         logger,
+			Checks:      checks,
 		},
 	}
 	results, err := v.Run(ctx)
 	if errors.Is(err, verify.ErrNothingFound) {
-		fmt.Fprintf(humanOut, "  ! no backups found at %s (looked for .dump .sql .backup .bak …, optionally .gz/.zst/.lz4)\n", src)
+		fmt.Fprintf(humanOut, "  ! no backups found at %s (looked for .dump .sql .backup .bak .archive …, optionally .gz/.zst/.lz4)\n", src)
 		return writeReport(nil, exitError, err)
 	}
 	h.Footer(results, *receiptsDir)
@@ -315,6 +332,25 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return writeReport(results, exitError, err)
 	}
 	return writeReport(results, verify.ExitCode(results), nil)
+}
+
+// customChecks collects repeated --check name=SQL flags.
+type customChecks []verify.CustomCheck
+
+func (c *customChecks) String() string { return "" }
+
+func (c *customChecks) Set(s string) error {
+	ck, err := verify.ParseCustomCheck(s)
+	if err != nil {
+		return err
+	}
+	for _, o := range *c {
+		if o.Name == ck.Name {
+			return fmt.Errorf("custom check %q given twice", ck.Name)
+		}
+	}
+	*c = append(*c, ck)
+	return nil
 }
 
 func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
