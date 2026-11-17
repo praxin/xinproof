@@ -85,6 +85,15 @@ jobs:
         if: success() || failure()
         run: go test -count=1 -v -run 'Conformance|EndToEnd|AzureErrors' ./internal/source/... ./internal/verify/
 
+      # Real AWS, no credentials: a public AWS Open Data bucket in eu-central-1
+      # (region auto-detected). Real-account tests for AWS/Azure/GCP/R2 come
+      # with read-only test identities.
+      - name: Real AWS (public bucket, unsigned)
+        if: success() || failure()
+        env:
+          XINPROOF_REAL_AWS: "1"
+        run: go test -count=1 -v -run RealAWS ./internal/source/s3/
+
       - name: Chaos tests (killed sandbox, blown budget, full disk, SIGKILL, Ctrl-C)
         if: success() || failure()
         run: go test -count=1 -v -timeout 20m ./internal/chaos/

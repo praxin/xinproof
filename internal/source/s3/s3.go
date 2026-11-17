@@ -28,6 +28,8 @@ type Options struct {
 	Region    string
 	Profile   string
 	PathStyle bool
+	// Anonymous sends unsigned requests (public buckets, like `aws --no-sign-request`).
+	Anonymous bool
 }
 
 type Source struct {
@@ -50,9 +52,20 @@ func New(ctx context.Context, bucket, prefix string, o Options) (*Source, error)
 	if o.Profile != "" {
 		lo = append(lo, config.WithSharedConfigProfile(o.Profile))
 	}
+	if o.Anonymous {
+		lo = append(lo, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
+	}
 	cfg, err := config.LoadDefaultConfig(ctx, lo...)
 	if err != nil {
 		return nil, fmt.Errorf("s3: loading AWS config: %w", err)
+	}
+	// On AWS itself, a bucket only answers in its own region. Unless the user
+	// chose one, ask S3 where the bucket lives (this needs no credentials and
+	// works for private buckets too) rather than failing with a redirect.
+	if o.Endpoint == "" && o.Region == "" {
+		if r, err := BucketRegion(ctx, bucket); err == nil && r != "" {
+			cfg.Region = r
+		}
 	}
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
@@ -156,6 +169,8 @@ func explain(err error, perm, bucket, key string) error {
 			return fmt.Errorf("access denied to %s/%s: the credentials need %s (%s)", bucket, key, perm, ae.ErrorMessage())
 		case "NoSuchBucket":
 			return fmt.Errorf("bucket %q does not exist (or is in another account/endpoint)", bucket)
+		case "PermanentRedirect", "AuthorizationHeaderMalformed", "IllegalLocationConstraintException", "301":
+			return fmt.Errorf("bucket %q is in a different region than requested: pass --region with the bucket's region (or leave --region unset so it's detected)", bucket)
 		case "InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken":
 			return fmt.Errorf("credentials rejected (%s): check AWS_PROFILE / AWS_ACCESS_KEY_ID or the endpoint", ae.ErrorCode())
 		}

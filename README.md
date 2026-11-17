@@ -101,7 +101,8 @@ Provider checksums are checked during L1 when the store has them: S3 `ChecksumSH
 | `--engine` | `auto` | `postgres` or `mysql` to restrict which dumps are tested |
 | `--pg-image`, `--mysql-image` | matched to the dump | override the sandbox image |
 | `--amcheck-budget` | `10m` | time budget for index verification (amcheck / CHECK TABLE); `0` disables it |
-| `--endpoint`, `--region`, `--profile`, `--path-style`, `--r2-account-id` | | storage options |
+| `--endpoint`, `--region`, `--profile`, `--path-style`, `--r2-account-id` | | storage options; on AWS the bucket's region is detected when `--region` is unset |
+| `--no-sign-request` | | S3: unsigned requests, for public buckets |
 | `--format` | `human` | `json` (schema `xinproof.report/v1`) or `junit` for CI; the report goes to stdout and human progress to stderr |
 | `--output FILE` | | write the json/junit report to a file and keep human output on stdout |
 | `--log-level`, `--log-format` | `warn`, `text` | structured logs on stderr (`debug`/`info`/`warn`/`error`/`off`; `text` or `json`) |

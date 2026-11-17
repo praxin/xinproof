@@ -136,9 +136,10 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	pgImage := fs.String("pg-image", "", "override the postgres sandbox image (default: postgres:<major of pg_dump>)")
 	dockerBin := fs.String("docker", "docker", "docker CLI binary")
 	endpoint := fs.String("endpoint", "", "custom storage endpoint: S3-compatible stores (B2, Wasabi, Ceph, SeaweedFS, …), Azurite, fake-gcs-server")
-	region := fs.String("region", "", "S3 region (default from AWS config, else us-east-1)")
+	region := fs.String("region", "", "S3 region (default: detected from the bucket on AWS)")
 	profile := fs.String("profile", "", "AWS shared-config profile")
-	pathStyle := fs.Bool("path-style", false, "use path-style S3 addressing (MinIO and most self-hosted stores)")
+	pathStyle := fs.Bool("path-style", false, "use path-style S3 addressing (most self-hosted S3-compatible stores)")
+	noSign := fs.Bool("no-sign-request", false, "S3: send unsigned requests (public buckets)")
 	r2Account := fs.String("r2-account-id", "", "Cloudflare account ID for r2:// (or R2_ACCOUNT_ID)")
 	noColor := fs.Bool("no-color", false, "disable colored output (NO_COLOR is honored too)")
 	format := fs.String("format", "human", "report format: human, json or junit")
@@ -216,7 +217,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	src, code, err := openSource(ctx, pos[0], s3src.Options{Endpoint: *endpoint, Region: *region, Profile: *profile, PathStyle: *pathStyle}, *r2Account)
+	src, code, err := openSource(ctx, pos[0], s3src.Options{Endpoint: *endpoint, Region: *region, Profile: *profile, PathStyle: *pathStyle, Anonymous: *noSign}, *r2Account)
 	if err != nil {
 		fmt.Fprintln(stderr, "xinproof:", err)
 		return writeReport(nil, code, err)
