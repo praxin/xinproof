@@ -144,7 +144,7 @@ func TestS3EndToEnd(t *testing.T) {
 		reason string
 	}{
 		"good.dump":    {receipt.Pass, ""},
-		"rotted.dump":  {receipt.Fail, "checksum mismatch: provider checksum"},
+		"rotted.dump":  {receipt.Fail, "checksum mismatch: provider SHA-256"},
 		"trunc.sql.gz": {receipt.Fail, "gzip stream ends early"},
 	}
 	if len(results) != len(want) {

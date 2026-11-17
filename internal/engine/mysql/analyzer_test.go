@@ -66,7 +66,7 @@ func TestAnalyzer(t *testing.T) {
 				t.Errorf("%s (chunk %d): %+v, want %s containing %q", tt.name, chunk, c, tt.status, tt.detail)
 			}
 			if tt.rows != nil && !reflect.DeepEqual(a.Rows, tt.rows) {
-				t.Errorf("%s (chunk %d): rows %q, want %q", tt.name, chunk, a.Rows, tt.rows)
+				t.Errorf("%s (chunk %d): rows %v, want %v", tt.name, chunk, a.Rows, tt.rows)
 			}
 		}
 	}

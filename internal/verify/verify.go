@@ -362,14 +362,11 @@ func (v *Verifier) one(parent context.Context, u unit) (res Result) {
 		d.out = errorOutcome(fmt.Sprintf("read %d bytes but the object is %d bytes (changed while reading?)", l1.size, d.obj.Size))
 		return
 	}
-	if want, from := v.expectedSHA(ctx, d.obj, sidecar); want != "" {
-		if !strings.EqualFold(want, l1.sha256) {
-			reason := fmt.Sprintf("checksum mismatch: %s says %s…, content is %s…", from, want[:12], l1.sha256[:12])
-			d.check("l1.checksum", receipt.CheckFail, reason)
-			d.out = failOutcome(reason)
-			return
-		}
-		d.check("l1.checksum", receipt.CheckPass, "matches "+from)
+	cks, mismatch := v.compareChecksums(ctx, d.obj, sidecar, l1.sums)
+	d.checks = append(d.checks, cks...)
+	if mismatch != "" {
+		d.out = failOutcome(mismatch)
+		return
 	}
 	for _, c := range anChecks {
 		d.checks = append(d.checks, c)
@@ -514,9 +511,9 @@ func (v *Verifier) streamMember(ctx context.Context, m source.Object, rel string
 		return "", 0, "", err
 	}
 	defer rc.Close()
-	h := sha256.New()
+	dg := newDigests()
 	src := &errReader{r: rc}
-	raw := &countReader{r: io.TeeReader(&ctxReader{ctx: ctx, r: src}, h)}
+	raw := &countReader{r: io.TeeReader(&ctxReader{ctx: ctx, r: src}, dg)}
 	var r io.Reader = raw
 	if tw != nil {
 		hdr := &tar.Header{Name: rel, Mode: 0o644, Size: m.Size, Typeflag: tar.TypeReg, ModTime: m.LastModified}
@@ -553,7 +550,11 @@ func (v *Verifier) streamMember(ctx context.Context, m source.Object, rel string
 		}
 		return "", raw.n, fmt.Sprintf("%s data is corrupt: %v", comp, cerr), nil
 	}
-	return hex.EncodeToString(h.Sum(nil)), raw.n, "", nil
+	got := dg.sums()
+	if _, mismatch := v.compareChecksums(ctx, m, "", got); mismatch != "" {
+		return "", raw.n, mismatch, nil
+	}
+	return got.SHA256, raw.n, "", nil
 }
 
 func errorOutcome(reason string) engine.Outcome {
@@ -613,6 +614,7 @@ func (v *Verifier) sniff(ctx context.Context, key string) (discover.Detection, e
 
 type l1Result struct {
 	sha256     string
+	sums       sums
 	size       int64 // raw bytes read
 	inner      int64 // decompressed bytes
 	sourceErr  error // the source failed → ERROR
@@ -627,16 +629,17 @@ func (v *Verifier) stream(ctx context.Context, obj source.Object, comp discover.
 		return
 	}
 	defer rc.Close()
-	h := sha256.New()
+	dg := newDigests()
 	src := &errReader{r: rc}
-	raw := &countReader{r: io.TeeReader(src, h)}
+	raw := &countReader{r: io.TeeReader(src, dg)}
 	defer func() {
 		r.size = raw.n
 		if r.sourceErr == nil && src.err != nil {
 			r.sourceErr, r.corruptErr = src.err, nil
 		}
 		if r.sourceErr == nil {
-			r.sha256 = hex.EncodeToString(h.Sum(nil))
+			r.sums = dg.sums()
+			r.sha256 = r.sums.SHA256
 		}
 	}()
 
@@ -682,24 +685,6 @@ func (v *Verifier) stream(ctx context.Context, obj source.Object, comp discover.
 		r.corruptErr = err
 	}
 	return
-}
-
-func (v *Verifier) expectedSHA(ctx context.Context, obj source.Object, sidecar string) (sum, from string) {
-	if sidecar != "" {
-		if rc, err := v.Src.Open(ctx, sidecar); err == nil {
-			defer rc.Close()
-			b, _ := io.ReadAll(io.LimitReader(rc, 4096))
-			if f := strings.Fields(string(b)); len(f) > 0 && len(f[0]) == 64 {
-				if _, err := hex.DecodeString(f[0]); err == nil {
-					return strings.ToLower(f[0]), "sidecar " + sidecar
-				}
-			}
-		}
-	}
-	if obj.SHA256 != "" {
-		return obj.SHA256, "provider checksum"
-	}
-	return "", ""
 }
 
 func (v *Verifier) build(d *draft, total time.Duration) *receipt.Receipt {

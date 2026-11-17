@@ -39,7 +39,7 @@ func TestRowCounts(t *testing.T) {
 		TableKey("shop", `We"ird.t`):             3,
 	}
 	if !reflect.DeepEqual(a.Rows, want) {
-		t.Errorf("rows = %q\nwant  %q", a.Rows, want)
+		t.Errorf("rows = %v\nwant  %v", a.Rows, want)
 	}
 }
 

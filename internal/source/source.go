@@ -17,6 +17,8 @@ type Object struct {
 	ETag         string    // provider ETag (S3) if any
 	LastModified time.Time // zero if unknown
 	SHA256       string    // full-object SHA-256 (hex) supplied by the provider, if any
+	MD5          string    // full-object MD5 (hex) supplied by the provider (Azure Content-MD5, GCS md5Hash), if any
+	CRC32C       string    // full-object CRC32C (hex, big-endian) supplied by the provider (GCS), if any
 }
 
 // Source is a read-only view of a backup location.

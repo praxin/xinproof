@@ -31,6 +31,8 @@ import (
 	"github.com/praxin/xinproof/internal/report"
 	"github.com/praxin/xinproof/internal/sandbox"
 	"github.com/praxin/xinproof/internal/source"
+	azsrc "github.com/praxin/xinproof/internal/source/azblob"
+	gcssrc "github.com/praxin/xinproof/internal/source/gcs"
 	"github.com/praxin/xinproof/internal/source/local"
 	s3src "github.com/praxin/xinproof/internal/source/s3"
 	"github.com/praxin/xinproof/internal/verify"
@@ -62,6 +64,9 @@ Locations:
   s3://bucket/prefix/                       AWS S3 (standard AWS credential chain)
   s3://bucket/prefix/ --endpoint URL        any S3-compatible store (MinIO, B2, Wasabi, …)
   r2://bucket/prefix/                       Cloudflare R2 (needs --r2-account-id or R2_ACCOUNT_ID)
+  azblob://account/container/prefix/        Azure Blob Storage / ADLS Gen2 (DefaultAzureCredential,
+                                            or AZURE_STORAGE_SAS_TOKEN / _KEY / _CONNECTION_STRING)
+  gs://bucket/prefix/                       Google Cloud Storage (Application Default Credentials)
 
 Exit codes: 0 all PASS · 1 any FAIL · 2 any ERROR (could not test) · 3 usage error
 
@@ -130,7 +135,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	mysqlImage := fs.String("mysql-image", "", "override the MySQL/MariaDB sandbox image (default: mysql:<major.minor> or mariadb:<major.minor> of the dumped server)")
 	pgImage := fs.String("pg-image", "", "override the postgres sandbox image (default: postgres:<major of pg_dump>)")
 	dockerBin := fs.String("docker", "docker", "docker CLI binary")
-	endpoint := fs.String("endpoint", "", "S3-compatible endpoint URL (MinIO, B2, Wasabi, Ceph, …)")
+	endpoint := fs.String("endpoint", "", "custom storage endpoint: S3-compatible stores (B2, Wasabi, Ceph, SeaweedFS, …), Azurite, fake-gcs-server")
 	region := fs.String("region", "", "S3 region (default from AWS config, else us-east-1)")
 	profile := fs.String("profile", "", "AWS shared-config profile")
 	pathStyle := fs.Bool("path-style", false, "use path-style S3 addressing (MinIO and most self-hosted stores)")
@@ -374,8 +379,24 @@ func openSource(ctx context.Context, loc string, o s3src.Options, r2Account stri
 			return nil, exitError, err
 		}
 		return s, 0, nil
-	case "azblob", "gs":
-		return nil, exitUsage, fmt.Errorf("%s:// sources are designed but not in this release yet (local folders, S3 and R2 work today)", scheme)
+	case "azblob":
+		account, rest2, _ := strings.Cut(rest, "/")
+		container, prefix, _ := strings.Cut(rest2, "/")
+		if account == "" || container == "" {
+			return nil, exitUsage, errors.New("azblob:// location must be azblob://<account>/<container>/<prefix>")
+		}
+		s, err := azsrc.New(ctx, account, container, prefix, azsrc.OptionsFromEnv(azsrc.Options{Endpoint: o.Endpoint}))
+		if err != nil {
+			return nil, exitError, err
+		}
+		return s, 0, nil
+	case "gs":
+		bucket, prefix, _ := strings.Cut(rest, "/")
+		s, err := gcssrc.New(ctx, bucket, prefix, gcssrc.Options{Endpoint: o.Endpoint})
+		if err != nil {
+			return nil, exitError, err
+		}
+		return s, 0, nil
 	}
 	return nil, exitUsage, fmt.Errorf("unknown location scheme %q", scheme)
 }

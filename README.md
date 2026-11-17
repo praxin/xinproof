@@ -20,7 +20,7 @@ $ xinproof receipt verify receipts/*.json
 ✓ receipt-000002.json  signature valid (pinned: this machine's key) · chain intact
 ```
 
-Status: pre-release (0.1.0). PostgreSQL (13–18) and MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4) work today, from local folders, S3, S3-compatible stores and Cloudflare R2. Azure Blob/ADLS Gen2 and GCS are next. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
+Status: pre-release (0.1.0). PostgreSQL (13–18) and MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4), from local folders, AWS S3, S3-compatible stores, Cloudflare R2, Azure Blob Storage / ADLS Gen2 and Google Cloud Storage. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
 
 ## What it does
 1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: every `pg_dump` format — custom (`-Fc`, including gzip/lz4/zstd compression inside), tar (`-Ft`), directory (`-Fd`, a folder holding `toc.dat`, treated as one backup) — and plain SQL from `pg_dump`/`pg_dumpall`; `mysqldump` and `mariadb-dump` output (with or without comments, extended or one-row inserts, single or `--databases`); whole files may also be gzip/zstd/lz4 compressed. Tarballs that aren't pg_dump archives are skipped.
@@ -61,8 +61,15 @@ xinproof version
 | AWS S3 | `s3://acme-backups/postgres/` | standard AWS chain: env vars, `--profile`, SSO, instance/task role, IRSA |
 | S3-compatible (MinIO, B2, Wasabi, Ceph, …) | `s3://bucket/prefix/ --endpoint https://minio:9000 --path-style` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
 | Cloudflare R2 | `r2://bucket/prefix/ --r2-account-id <id>` (or `R2_ACCOUNT_ID`) | R2 API token as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
+| Azure Blob Storage / ADLS Gen2 | `azblob://account/container/prefix/` (`--endpoint` for Azurite, sovereign clouds, private endpoints) | `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_SAS_TOKEN`, `AZURE_STORAGE_KEY`, else the default Azure chain (env, workload identity, managed identity, `az login`) |
+| Google Cloud Storage | `gs://bucket/prefix/` (`--endpoint` or `STORAGE_EMULATOR_HOST` for emulators) | Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`, workload identity) |
 
-Least privilege for S3: `s3:ListBucket` on the bucket (prefix) and `s3:GetObject` on the objects. Nothing else is called.
+Least privilege — nothing beyond list and read is ever called:
+- **S3 / R2 / compatible:** `s3:ListBucket` on the bucket (prefix) and `s3:GetObject` on the objects.
+- **Azure:** the `Storage Blob Data Reader` role on the container, or a SAS with only **read + list** (tested).
+- **GCS:** `storage.objects.list` and `storage.objects.get` (e.g. `roles/storage.objectViewer`); the client requests the read-only OAuth scope.
+
+Provider checksums are checked during L1 when the store has them: S3 `ChecksumSHA256` (single-part uploads), Azure `Content-MD5`, GCS MD5 (non-composite objects) and CRC32C. A mismatch is a FAIL.
 
 ### `verify` flags
 | Flag | Default | Meaning |
@@ -99,7 +106,7 @@ go test -short ./...                       # unit tests, no Docker needed
 go test ./...                              # plus real restores in Docker (corrupted dumps must FAIL)
 bash scripts/demo.sh                       # one good + one truncated dump, end to end
 ```
-CI (`.github/workflows/ci.yml`) runs `go mod tidy` drift check, build, vet, gofmt, race-enabled unit tests, the Docker integration test, the demo, and govulncheck on every push.
+CI (`.github/workflows/ci.yml`) runs a `go mod tidy` drift check, cross-builds, vet, gofmt, race-enabled unit tests, the storage conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), restores against every supported PostgreSQL (13–18), MySQL (8.0, 8.4) and MariaDB (10.11, 11.4), the demo, the JSON/JUnit report checks and govulncheck on every push.
 
 ## License
 Apache-2.0 (planned)

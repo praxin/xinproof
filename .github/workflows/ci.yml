@@ -81,6 +81,10 @@ jobs:
         if: success() || failure()
         run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/ ./internal/engine/mysql/
 
+      - name: Storage backends against emulators (SeaweedFS S3, Azurite, fake-gcs-server)
+        if: success() || failure()
+        run: go test -count=1 -v -run 'Conformance|EndToEnd|AzureErrors' ./internal/source/... ./internal/verify/
+
       - name: Demo (one good, one truncated dump)
         if: success() || failure()
         env:
