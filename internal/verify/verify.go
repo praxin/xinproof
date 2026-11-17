@@ -4,6 +4,7 @@
 package verify
 
 import (
+	"archive/tar"
 	"bufio"
 	"context"
 	"crypto/ed25519"
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -90,26 +92,13 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing %s: %w", v.Src, err)
 	}
-	sidecars := map[string]string{}
-	var cands []source.Object
-	skipped := 0
-	for _, o := range objs {
-		if target, ok := discover.IsSidecar(o.Key); ok {
-			sidecars[target] = o.Key
-			continue
-		}
-		if discover.IsCandidate(o.Name) {
-			cands = append(cands, o)
-		} else {
-			skipped++
-		}
-	}
+	cands, skipped := v.plan(ctx, objs)
 	if v.Opts.Since > 0 {
 		cut := v.now().Add(-v.Opts.Since)
 		kept := cands[:0]
-		for _, o := range cands {
-			if o.LastModified.IsZero() || o.LastModified.After(cut) {
-				kept = append(kept, o)
+		for _, u := range cands {
+			if u.obj.LastModified.IsZero() || u.obj.LastModified.After(cut) {
+				kept = append(kept, u)
 			}
 		}
 		cands = kept
@@ -121,10 +110,10 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 		return nil, ErrNothingFound
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
-		if !cands[i].LastModified.Equal(cands[j].LastModified) {
-			return cands[i].LastModified.After(cands[j].LastModified)
+		if !cands[i].obj.LastModified.Equal(cands[j].obj.LastModified) {
+			return cands[i].obj.LastModified.After(cands[j].obj.LastModified)
 		}
-		return cands[i].Name < cands[j].Name
+		return cands[i].obj.Name < cands[j].obj.Name
 	})
 	plan := Plan{Found: len(cands), Testing: len(cands), Skipped: skipped}
 	if v.Opts.Newest > 0 && v.Opts.Newest < len(cands) {
@@ -138,7 +127,8 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 	v.log().Info("plan", "location", v.Src.String(), "found", plan.Found, "testing", plan.Testing, "skipped", plan.Skipped)
 
 	var results []Result
-	for _, o := range cands {
+	for _, u := range cands {
+		o := u.obj
 		var r Result
 		if ctx.Err() != nil {
 			// Never silently partial: backups we didn't get to still end in ERROR, with a receipt.
@@ -147,7 +137,7 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 			if v.Opts.OnStart != nil {
 				v.Opts.OnStart(o)
 			}
-			r = v.one(ctx, o, sidecars[o.Key])
+			r = v.one(ctx, u)
 		}
 		if err := v.issue(&r); err != nil {
 			return results, fmt.Errorf("writing receipt for %s: %w", o.Name, err)
@@ -160,6 +150,70 @@ func (v *Verifier) Run(ctx context.Context) ([]Result, error) {
 		}
 	}
 	return results, ctx.Err()
+}
+
+// unit is one backup: a single object, or a pg_dump -Fd directory.
+type unit struct {
+	obj     source.Object   // the object, or for a directory a synthetic object for the whole folder
+	sidecar string          // key of a .sha256 sidecar, if any
+	toc     source.Object   // directory format: its toc.dat
+	members []source.Object // directory format: every file in the folder (toc.dat included)
+}
+
+func (u unit) isDir() bool { return len(u.members) > 0 }
+
+// plan turns a listing into backups. Directory-format dumps (a folder holding
+// toc.dat) become one backup each; tar files count only if their content is a
+// pg_dump tar archive; everything else that doesn't look like a dump is skipped.
+func (v *Verifier) plan(ctx context.Context, objs []source.Object) (units []unit, skipped int) {
+	sidecars := map[string]string{}
+	dirs := map[string]*unit{}
+	for _, o := range objs {
+		if discover.IsDirectoryTOC(o.Key) {
+			dir := path.Dir(o.Key)
+			name := path.Dir(o.Name)
+			if name == "." {
+				name = path.Base(strings.TrimRight(v.Src.String(), "/"))
+			}
+			url := strings.TrimSuffix(o.URL, "toc.dat")
+			dirs[dir] = &unit{obj: source.Object{Key: o.Key, Name: name + "/", URL: url}, toc: o}
+		}
+	}
+	for _, o := range objs {
+		if u, ok := dirs[path.Dir(o.Key)]; ok {
+			u.members = append(u.members, o)
+			u.obj.Size += o.Size
+			if o.LastModified.After(u.obj.LastModified) {
+				u.obj.LastModified = o.LastModified
+			}
+			continue
+		}
+		if target, ok := discover.IsSidecar(o.Key); ok {
+			sidecars[target] = o.Key
+			continue
+		}
+		switch {
+		case discover.IsCandidate(o.Name):
+			units = append(units, unit{obj: o})
+		case discover.IsTarCandidate(o.Name):
+			// Only a pg_dump tar archive is a backup; other tarballs are skipped.
+			if det, err := v.sniff(ctx, o.Key); err != nil || det.Format == discover.FormatPGTar {
+				units = append(units, unit{obj: o}) // read errors still end as ERROR, never silently skipped
+			} else {
+				skipped++
+			}
+		default:
+			skipped++
+		}
+	}
+	for i := range units {
+		units[i].sidecar = sidecars[units[i].obj.Key]
+	}
+	for _, u := range dirs {
+		sort.Slice(u.members, func(i, j int) bool { return u.members[i].Key < u.members[j].Key })
+		units = append(units, *u)
+	}
+	return units, skipped
 }
 
 func (v *Verifier) notTested(o source.Object, reason string) Result {
@@ -181,7 +235,8 @@ func (d *draft) check(id, status, detail string) {
 	d.checks = append(d.checks, receipt.Check{ID: id, Status: status, Detail: detail})
 }
 
-func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string) (res Result) {
+func (v *Verifier) one(parent context.Context, u unit) (res Result) {
+	obj, sidecar := u.obj, u.sidecar
 	start := time.Now()
 	d := &draft{obj: obj}
 	lg := v.log().With("backup", obj.URL)
@@ -214,6 +269,10 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 		return what + ": " + err.Error()
 	}
 
+	if u.isDir() {
+		v.oneDir(ctx, d, u, budget)
+		return
+	}
 	if st, err := v.Src.Stat(ctx, obj.Key); err == nil {
 		d.obj = st
 		d.obj.Name = obj.Name
@@ -235,6 +294,13 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 	if det.Format == discover.FormatEmpty || (det.Problem != "" && det.Format != discover.FormatMySQL) {
 		d.check("l1.format", receipt.CheckFail, det.Problem)
 		d.out = failOutcome(det.Problem)
+		return
+	}
+	if det.Format == discover.FormatPGDir {
+		// A lone toc.dat (or a file holding one) is only the index of a directory dump.
+		reason := "this is the toc.dat of a directory-format dump, not a complete backup on its own"
+		d.check("l1.format", receipt.CheckFail, reason)
+		d.out = failOutcome(reason)
 		return
 	}
 	d.check("l1.format", receipt.CheckPass, describe(det))
@@ -262,6 +328,11 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 		sink, wait = sess.Upload(ctx)
 	}
 	l1 := v.stream(ctx, d.obj, det.Compression, sink, an)
+	// Finish the analyzer right away (it may hold a goroutine) and use its checks below.
+	var anChecks []receipt.Check
+	if an != nil {
+		anChecks = an.Finish()
+	}
 	var uploadErr error
 	if sink != nil {
 		sink.Close()
@@ -300,13 +371,11 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 		}
 		d.check("l1.checksum", receipt.CheckPass, "matches "+from)
 	}
-	if an != nil {
-		for _, c := range an.Finish() {
-			d.checks = append(d.checks, c)
-			if c.Status == receipt.CheckFail {
-				d.out = failOutcome(c.Detail)
-				return
-			}
+	for _, c := range anChecks {
+		d.checks = append(d.checks, c)
+		if c.Status == receipt.CheckFail {
+			d.out = failOutcome(c.Detail)
+			return
 		}
 	}
 
@@ -329,6 +398,162 @@ func (v *Verifier) one(parent context.Context, obj source.Object, sidecar string
 	}
 	d.checks = append(d.checks, d.out.Checks...)
 	return
+}
+
+// oneDir verifies a pg_dump -Fd directory: every file is read once, hashed,
+// checked for compression integrity, and streamed into the sandbox as a tar.
+// The subject hash is the SHA-256 of the sorted per-file manifest.
+func (v *Verifier) oneDir(ctx context.Context, d *draft, u unit, budget func(error, string) string) {
+	det, srcErr := v.sniff(ctx, u.toc.Key)
+	d.det = det
+	if srcErr != nil {
+		d.out = errorOutcome(budget(srcErr, "reading toc.dat"))
+		return
+	}
+	if det.Format != discover.FormatPGDir || det.Problem != "" {
+		reason := det.Problem
+		if reason == "" {
+			reason = fmt.Sprintf("toc.dat is not a pg_dump directory-format TOC (looks like %s)", det.Format)
+		}
+		reason = "toc.dat: " + reason
+		d.check("l1.format", receipt.CheckFail, reason)
+		d.out = failOutcome(reason)
+		return
+	}
+	d.check("l1.format", receipt.CheckPass, fmt.Sprintf("%s, %d files", describe(det), len(u.members)))
+
+	var sess engine.Session
+	var startErr error
+	if v.Engine.Supports(det) {
+		sess, startErr = v.Engine.Start(ctx, det)
+		if sess != nil {
+			defer sess.Close()
+			d.image = sess.Image()
+		}
+	}
+	var sink io.WriteCloser
+	var wait func() error
+	var sw *errWriter
+	var tw *tar.Writer
+	if sess != nil {
+		sink, wait = sess.UploadDir(ctx)
+		sw = &errWriter{w: sink}
+		tw = tar.NewWriter(sw)
+	}
+
+	dir := path.Dir(u.toc.Key)
+	var manifest strings.Builder
+	var total int64
+	for _, m := range u.members {
+		rel := strings.TrimPrefix(strings.TrimPrefix(m.Key, dir), "/")
+		if dir == "." {
+			rel = m.Key
+		}
+		sum, n, corrupt, err := v.streamMember(ctx, m, rel, tw)
+		if err != nil {
+			if sink != nil {
+				sink.Close()
+				wait()
+			}
+			d.out = errorOutcome(budget(err, "reading "+rel))
+			return
+		}
+		if corrupt != "" {
+			if sink != nil {
+				sink.Close()
+				wait()
+			}
+			reason := rel + ": " + corrupt
+			d.check("l1.decompress", receipt.CheckFail, reason)
+			d.out = failOutcome(reason)
+			return
+		}
+		fmt.Fprintf(&manifest, "%s  %s\n", sum, rel)
+		total += n
+	}
+	var uploadErr error
+	if tw != nil {
+		if err := tw.Close(); err != nil && sw.err == nil {
+			uploadErr = err
+		}
+		sink.Close()
+		uploadErr = firstErr(uploadErr, wait())
+	}
+	ms := sha256.Sum256([]byte(manifest.String()))
+	d.sha = hex.EncodeToString(ms[:])
+	d.check("l1.sha256", receipt.CheckPass, fmt.Sprintf("manifest sha256:%s over %d files (%d bytes)", d.sha, len(u.members), total))
+
+	if !v.Engine.Supports(det) {
+		d.out = errorOutcome(unsupported(det))
+		return
+	}
+	if startErr != nil {
+		d.out = errorOutcome(budget(startErr, "sandbox"))
+		return
+	}
+	if sw != nil && sw.err != nil {
+		uploadErr = firstErr(sw.err, uploadErr)
+	}
+	if uploadErr != nil {
+		d.out = errorOutcome(budget(uploadErr, "uploading to the sandbox"))
+		return
+	}
+	d.out = sess.Restore(ctx, nil)
+	if d.out.Result == "" {
+		d.out = errorOutcome("engine returned no result")
+	}
+	d.checks = append(d.checks, d.out.Checks...)
+}
+
+// streamMember reads one file of a directory dump, adds it to the tar (if
+// any), and returns its SHA-256. corrupt is set when a compressed data file
+// fails to decompress (FAIL); err when the source fails (ERROR).
+func (v *Verifier) streamMember(ctx context.Context, m source.Object, rel string, tw *tar.Writer) (sum string, n int64, corrupt string, err error) {
+	rc, err := v.Src.Open(ctx, m.Key)
+	if err != nil {
+		return "", 0, "", err
+	}
+	defer rc.Close()
+	h := sha256.New()
+	src := &errReader{r: rc}
+	raw := &countReader{r: io.TeeReader(&ctxReader{ctx: ctx, r: src}, h)}
+	var r io.Reader = raw
+	if tw != nil {
+		hdr := &tar.Header{Name: rel, Mode: 0o644, Size: m.Size, Typeflag: tar.TypeReg, ModTime: m.LastModified}
+		if err := tw.WriteHeader(hdr); err == nil {
+			r = io.TeeReader(raw, tw)
+		}
+	}
+	comp := discover.MemberCompression(rel)
+	var cerr error
+	if comp != discover.None {
+		dec, derr := discover.NewDecompressor(comp, r)
+		if derr != nil {
+			cerr = derr
+		} else {
+			_, cerr = io.Copy(io.Discard, dec)
+			dec.Close()
+		}
+	}
+	if _, err := io.Copy(io.Discard, r); err != nil && src.err == nil && ctx.Err() == nil {
+		cerr = firstErr(cerr, err)
+	}
+	if src.err != nil {
+		return "", raw.n, "", src.err
+	}
+	if ctx.Err() != nil {
+		return "", raw.n, "", ctx.Err()
+	}
+	if raw.n != m.Size {
+		return "", raw.n, "", fmt.Errorf("read %d bytes but the listing says %d (changed while reading?)", raw.n, m.Size)
+	}
+	if cerr != nil {
+		if errors.Is(cerr, io.ErrUnexpectedEOF) {
+			return "", raw.n, fmt.Sprintf("%s stream ends early at byte %d (truncated)", comp, raw.n), nil
+		}
+		return "", raw.n, fmt.Sprintf("%s data is corrupt: %v", comp, cerr), nil
+	}
+	return hex.EncodeToString(h.Sum(nil)), raw.n, "", nil
 }
 
 func errorOutcome(reason string) engine.Outcome {

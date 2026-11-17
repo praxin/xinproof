@@ -13,9 +13,9 @@ A receipt is a JSON document that records what xinproof did to one backup and wh
 | `issued_at` | string | RFC 3339 UTC time the receipt was issued. |
 | `subject.source` | string | Where the backup lives: `s3://bucket/key`, `r2://…`, or an absolute local path. |
 | `subject.size` | integer | Size in bytes, from the storage provider. |
-| `subject.sha256` | string | Hex SHA-256 of the object's bytes as stored (compressed), computed by reading all of it. Absent if the object wasn't read in full (rejected from its header, or a read error). |
+| `subject.sha256` | string | Hex SHA-256 of the object's bytes as stored (compressed), computed by reading all of it. For a directory-format dump: SHA-256 of the manifest, one line `<sha256 of file>  <file name>` per file, sorted by name. Absent if the object wasn't read in full (rejected from its header, or a read error). |
 | `subject.etag`, `subject.last_modified` | string | Provider metadata, when available. |
-| `subject.format` | string | `postgres-custom`, `postgres-plain`, `mysql-plain`, `empty` or `unknown`. |
+| `subject.format` | string | `postgres-custom`, `postgres-tar`, `postgres-directory`, `postgres-plain`, `mysql-plain`, `empty` or `unknown`. |
 | `subject.compression` | string | `gzip`, `zstd`, `lz4`, or absent. |
 | `engine.kind` | string | `postgres` or `mysql`. |
 | `engine.dump_version`, `engine.server_version` | string | Versions read from the dump header. |
@@ -30,7 +30,7 @@ A receipt is a JSON document that records what xinproof did to one backup and wh
 | `chain.prev` | string | `sha256:<hex>` of the previous receipt (see §3). For seq 1 it is `sha256:` followed by 64 zeros. |
 | `signature` | object | See §2. |
 
-Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows`.
+Check IDs used by v1: `l1.format`, `l1.sha256`, `l1.checksum` (sidecar or provider checksum), `l1.decompress`, `l1.structure` (plain-dump and tar-archive completeness), `l2.toc`, `l2.roles`, `l2.restore`, `l2.objects`, `l2.rows` (exact counts, every table compared with the rows the dump holds), `l2.schema_hash`, `l2.amcheck`. New check IDs may appear in later v1 releases; verifiers must not reject unknown ones.
 
 **Privacy:** receipts never contain row data. They contain counts, hashes, versions and the backup's location.
 

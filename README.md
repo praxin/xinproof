@@ -23,10 +23,15 @@ $ xinproof receipt verify receipts/*.json
 Status: pre-release (0.1.0). Postgres works today, from local folders, S3, S3-compatible stores and Cloudflare R2. MySQL, Azure Blob/ADLS Gen2 and GCS are next. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
 
 ## What it does
-1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: `pg_dump` custom format (`PGDMP`), plain SQL from `pg_dump`/`pg_dumpall`, optionally gzip/zstd/lz4 compressed. MySQL dumps are recognized and reported as not yet testable.
-2. **Checks integrity** (L1): SHA-256 of the whole object, compared with a `<file>.sha256` sidecar or the S3 `ChecksumSHA256` when present; full decompression; plain dumps must end with pg_dump's "dump complete" trailer and must not stop inside table data.
+1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: every `pg_dump` format — custom (`-Fc`, including gzip/lz4/zstd compression inside), tar (`-Ft`), directory (`-Fd`, a folder holding `toc.dat`, treated as one backup) — and plain SQL from `pg_dump`/`pg_dumpall`; whole files may also be gzip/zstd/lz4 compressed. Tarballs that aren't pg_dump archives are skipped. MySQL dumps are recognized and reported as not yet testable.
+2. **Checks integrity** (L1): SHA-256 of the whole object (for a directory dump, of the per-file manifest), compared with a `<file>.sha256` sidecar or the S3 `ChecksumSHA256` when present; full decompression of the object and of every compressed data file; plain dumps must end with pg_dump's "dump complete" trailer and must not stop inside table data; tar archives must be complete, with their end-of-archive marker. (`pg_restore` restores a truncated tar archive without complaint, so this matters.)
 3. **Restores** (L2) each backup into a fresh `postgres:<major>` container matching the `pg_dump` version: **no network**, memory/CPU/PID limits, all capabilities dropped except the few the image needs, `no-new-privileges`. `pg_restore --exit-on-error` or `psql -v ON_ERROR_STOP=1`.
-4. **Checks the result**: tables restored vs. the dump's table of contents, exact row counts, restore duration.
+4. **Checks the result**:
+   - tables restored vs. the dump's table of contents;
+   - **row audit**: the exact row count of every table is compared with the rows the dump holds for it — any table that lost rows is a FAIL;
+   - **index integrity**: `amcheck` (`bt_index_check` with `heapallindexed`) on every B-tree index, largest first, within `--amcheck-budget`;
+   - **schema hash**: a SHA-256 fingerprint of columns, types, constraints and indexes, identical for the same database whatever the dump format;
+   - restore duration (the measured RTO).
 5. **Signs a receipt** for every backup: Ed25519 over the RFC 8785 canonical JSON, hash-chained to the previous receipt.
 
 Every backup ends in exactly one of **PASS**, **FAIL** (it won't restore, with the reason) or **ERROR** (it couldn't be tested, with the reason). Nothing is silently skipped. Sandboxes are always removed: on success, on failure, on Ctrl-C, and, if the CLI is killed, by a reaper at the start of the next run (containers carry `xinproof.*` labels and an expiry).
@@ -69,6 +74,7 @@ Least privilege for S3: `s3:ListBucket` on the bucket (prefix) and `s3:GetObject
 | `--memory`, `--cpus` | `2g`, `2` | sandbox limits |
 | `--tmpfs SIZE` | off | keep the dump and restored data in RAM instead of the container's disk |
 | `--pg-image` | `postgres:<major>` | override the sandbox image |
+| `--amcheck-budget` | `10m` | time budget per database for index verification; `0` disables it |
 | `--endpoint`, `--region`, `--profile`, `--path-style`, `--r2-account-id` | | storage options |
 | `--format` | `human` | `json` (schema `xinproof.report/v1`) or `junit` for CI; the report goes to stdout and human progress to stderr |
 | `--output FILE` | | write the json/junit report to a file and keep human output on stdout |

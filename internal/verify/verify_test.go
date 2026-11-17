@@ -38,7 +38,11 @@ type fakeEngine struct {
 }
 
 func (f *fakeEngine) Supports(d discover.Detection) bool {
-	return d.Format == discover.FormatPGCustom || d.Format == discover.FormatPGPlain
+	switch d.Format {
+	case discover.FormatPGCustom, discover.FormatPGPlain, discover.FormatPGTar, discover.FormatPGDir:
+		return true
+	}
+	return false
 }
 
 func (f *fakeEngine) Analyzer(d discover.Detection) engine.Analyzer {
@@ -70,6 +74,11 @@ type nopWC struct{ io.Writer }
 func (nopWC) Close() error { return nil }
 
 func (s *fakeSession) Upload(ctx context.Context) (io.WriteCloser, func() error) {
+	return nopWC{&s.buf}, func() error { return nil }
+}
+
+// UploadDir captures the tar stream; Restore stores it like a single upload.
+func (s *fakeSession) UploadDir(ctx context.Context) (io.WriteCloser, func() error) {
 	return nopWC{&s.buf}, func() error { return nil }
 }
 

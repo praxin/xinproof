@@ -55,6 +55,7 @@ Usage:
 
 Locations:
   ./dumps/  /mnt/backups/pg.dump            local folder (recursive) or one file
+                                            (pg_dump custom, tar, directory and plain SQL; gzip/zstd/lz4)
   s3://bucket/prefix/                       AWS S3 (standard AWS credential chain)
   s3://bucket/prefix/ --endpoint URL        any S3-compatible store (MinIO, B2, Wasabi, …)
   r2://bucket/prefix/                       Cloudflare R2 (needs --r2-account-id or R2_ACCOUNT_ID)
@@ -122,6 +123,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	memory := fs.String("memory", "2g", "sandbox memory limit")
 	cpus := fs.String("cpus", "2", "sandbox CPU limit")
 	tmpfs := fs.String("tmpfs", "", "keep the dump and restored data on a tmpfs of this size (e.g. 2g) instead of disk")
+	amcheck := fs.Duration("amcheck-budget", 10*time.Minute, "time budget per database for B-tree index verification (amcheck); 0 disables")
 	pgImage := fs.String("pg-image", "", "override the postgres sandbox image (default: postgres:<major of pg_dump>)")
 	dockerBin := fs.String("docker", "docker", "docker CLI binary")
 	endpoint := fs.String("endpoint", "", "S3-compatible endpoint URL (MinIO, B2, Wasabi, Ceph, …)")
@@ -242,6 +244,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		CPUs:      *cpus,
 		TmpfsSize: *tmpfs,
 		TTL:       *timeout + 15*time.Minute,
+
+		AmcheckBudget: *amcheck,
 	}
 	v := &verify.Verifier{
 		Src:    src,

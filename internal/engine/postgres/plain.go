@@ -25,12 +25,28 @@ type PlainAnalyzer struct {
 	Tables     int
 	referenced map[string]bool
 	created    map[string]bool
+
+	// Rows is the number of data rows the dump holds per table, keyed by
+	// TableKey(database, "schema.table"). Database is "" until a \connect.
+	Rows    map[string]int64
+	db      string
+	copyKey string
 }
 
 const maxLine = 1 << 20
 
 func NewPlainAnalyzer() *PlainAnalyzer {
-	return &PlainAnalyzer{referenced: map[string]bool{}, created: map[string]bool{}}
+	return &PlainAnalyzer{referenced: map[string]bool{}, created: map[string]bool{}, Rows: map[string]int64{}}
+}
+
+// TableKey identifies a table across databases. db "" is the database the
+// dump was restored into (no \connect).
+func TableKey(db, qualified string) string { return db + "\x00" + qualified }
+
+// SplitTableKey is the inverse of TableKey.
+func SplitTableKey(k string) (db, qualified string) {
+	db, qualified, _ = strings.Cut(k, "\x00")
+	return db, qualified
 }
 
 func (a *PlainAnalyzer) Write(p []byte) (int, error) {
@@ -81,11 +97,21 @@ func (a *PlainAnalyzer) processLine(l string) {
 	if a.inCopy {
 		if l == `\.` {
 			a.inCopy = false
+		} else {
+			a.Rows[a.copyKey]++
 		}
 		return
 	}
 	if strings.HasPrefix(l, "COPY ") && strings.HasSuffix(strings.TrimSpace(l), "FROM stdin;") {
 		a.inCopy = true
+		a.copyKey = TableKey(a.db, parseQualified(l[len("COPY "):]))
+		if _, ok := a.Rows[a.copyKey]; !ok {
+			a.Rows[a.copyKey] = 0
+		}
+		return
+	}
+	if strings.HasPrefix(l, `\connect `) || strings.HasPrefix(l, `\c `) {
+		a.db = parseConnect(l)
 		return
 	}
 	if reCreateTable.MatchString(l) {
@@ -198,6 +224,70 @@ func parseIdents(s string) []string {
 	}
 	flush()
 	return out
+}
+
+// parseQualified reads `schema.table` (either part possibly quoted) from the
+// start of s and returns it unquoted, as pg_catalog stores it.
+func parseQualified(s string) string {
+	var parts []string
+	i := 0
+	for len(parts) < 2 && i < len(s) {
+		var id strings.Builder
+		if s[i] == '"' {
+			i++
+			for i < len(s) {
+				if s[i] == '"' {
+					if i+1 < len(s) && s[i+1] == '"' {
+						id.WriteByte('"')
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				id.WriteByte(s[i])
+				i++
+			}
+		} else {
+			for i < len(s) && s[i] != '.' && s[i] != ' ' && s[i] != '(' {
+				id.WriteByte(s[i])
+				i++
+			}
+		}
+		parts = append(parts, id.String())
+		if i < len(s) && s[i] == '.' {
+			i++
+			continue
+		}
+		break
+	}
+	if len(parts) == 1 {
+		return "public." + parts[0]
+	}
+	return strings.Join(parts, ".")
+}
+
+// parseConnect returns the database named by a psql \connect line, as written by
+// pg_dump -C and pg_dumpall: `\connect name`, `\connect "Name"` or
+// `\connect -reuse-previous=on "dbname='name'"`.
+func parseConnect(l string) string {
+	f := strings.Fields(l)
+	if len(f) < 2 {
+		return ""
+	}
+	arg := f[1]
+	if strings.HasPrefix(arg, "-reuse-previous") && len(f) > 2 {
+		arg = strings.Join(f[2:], " ")
+		arg = strings.Trim(arg, `"`)
+		if v, ok := strings.CutPrefix(arg, "dbname="); ok {
+			return strings.ReplaceAll(strings.Trim(v, "'"), "''", "'")
+		}
+		return arg
+	}
+	if strings.HasPrefix(arg, `"`) {
+		return strings.ReplaceAll(strings.Trim(strings.Join(f[1:], " "), `"`), `""`, `"`)
+	}
+	return arg
 }
 
 // quoteIdent quotes a role name for SQL.

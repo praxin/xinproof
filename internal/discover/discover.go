@@ -35,9 +35,11 @@ type Format string
 const (
 	FormatEmpty    Format = "empty"
 	FormatUnknown  Format = "unknown"
-	FormatPGCustom Format = "postgres-custom" // pg_dump -Fc
-	FormatPGPlain  Format = "postgres-plain"  // pg_dump / pg_dumpall plain SQL
-	FormatMySQL    Format = "mysql-plain"     // mysqldump / mariadb-dump
+	FormatPGCustom Format = "postgres-custom"    // pg_dump -Fc
+	FormatPGPlain  Format = "postgres-plain"     // pg_dump / pg_dumpall plain SQL
+	FormatPGTar    Format = "postgres-tar"       // pg_dump -Ft
+	FormatPGDir    Format = "postgres-directory" // pg_dump -Fd (a folder holding toc.dat and data files)
+	FormatMySQL    Format = "mysql-plain"        // mysqldump / mariadb-dump
 )
 
 type Detection struct {
@@ -60,6 +62,37 @@ var candidateExt = map[string]bool{
 var compressionExt = map[string]bool{".gz": true, ".gzip": true, ".zst": true, ".zstd": true, ".lz4": true}
 
 // IsCandidate reports whether an object name looks like a database backup.
+// IsTarCandidate reports whether name may be a pg_dump tar-format archive.
+// Tar files are common for other things too, so these are only treated as
+// backups if their content is a pg_dump tar archive.
+func IsTarCandidate(name string) bool {
+	base := strings.ToLower(path.Base(name))
+	ext := path.Ext(base)
+	if ext == ".tgz" {
+		return true
+	}
+	if compressionExt[ext] {
+		ext = path.Ext(strings.TrimSuffix(base, ext))
+	}
+	return ext == ".tar"
+}
+
+// IsDirectoryTOC reports whether name is the toc.dat of a pg_dump -Fd directory.
+func IsDirectoryTOC(name string) bool { return path.Base(name) == "toc.dat" }
+
+// MemberCompression guesses a directory-format data file's compression from its extension.
+func MemberCompression(name string) Compression {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".gz":
+		return Gzip
+	case ".zst":
+		return Zstd
+	case ".lz4":
+		return LZ4
+	}
+	return None
+}
+
 func IsCandidate(name string) bool {
 	base := strings.ToLower(path.Base(name))
 	ext := path.Ext(base)
@@ -157,12 +190,49 @@ var (
 	reMySQLServer = regexp.MustCompile(`(?m)^-- Server version\s+(\S+)`)
 )
 
+// pg_dump archive format bytes (pg_backup.h: archCustom, archTar, archDirectory).
+const (
+	archCustom    = 1
+	archTar       = 3
+	archDirectory = 5
+)
+
 func detectContent(d *Detection, b []byte) {
+	if len(b) >= 512 && string(b[257:262]) == "ustar" {
+		name := string(bytes.TrimRight(b[:100], "\x00"))
+		if name != "toc.dat" {
+			d.Format = FormatUnknown
+			d.Problem = fmt.Sprintf("a tar archive, but not a pg_dump tar-format archive (first entry %q)", name)
+			return
+		}
+		d.Format, d.Engine = FormatPGTar, "postgres"
+		h, err := ParsePGDMP(b[512:])
+		if err == nil && h.Format != archTar {
+			err = fmt.Errorf("tar archive's toc.dat has archive format %d, expected tar (%d)", h.Format, archTar)
+		}
+		if err != nil {
+			d.Problem = err.Error()
+			return
+		}
+		d.DumpVersion, d.ServerVersion = firstWord(h.DumpVersion), firstWord(h.ServerVersion)
+		return
+	}
 	if bytes.HasPrefix(b, []byte("PGDMP")) {
 		d.Format, d.Engine = FormatPGCustom, "postgres"
 		h, err := ParsePGDMP(b)
 		if err != nil {
 			d.Problem = err.Error()
+			return
+		}
+		switch h.Format {
+		case archCustom:
+		case archTar, archDirectory:
+			// A bare PGDMP header with the tar/directory format byte is the
+			// toc.dat of a directory-format dump (pg_dump writes archTar there);
+			// the caller groups the folder.
+			d.Format = FormatPGDir
+		default:
+			d.Problem = fmt.Sprintf("pg_dump archive format %d is not restorable from a single file", h.Format)
 			return
 		}
 		d.DumpVersion, d.ServerVersion = firstWord(h.DumpVersion), firstWord(h.ServerVersion)
@@ -240,8 +310,8 @@ func ParsePGDMP(b []byte) (PGHeader, error) {
 	if h.IntSize < 1 || h.IntSize > 8 || h.OffSize < 1 || h.OffSize > 8 {
 		return h, fmt.Errorf("pg_dump archive header is corrupt (int size %d, offset size %d)", h.IntSize, h.OffSize)
 	}
-	if h.Format != 1 {
-		return h, fmt.Errorf("pg_dump archive format %d is not the custom format (only -Fc archives are supported)", h.Format)
+	if h.Format != archCustom && h.Format != archTar && h.Format != archDirectory {
+		return h, fmt.Errorf("pg_dump archive header is corrupt (unknown archive format %d)", h.Format)
 	}
 	r.intSize = h.IntSize
 	ver := h.VMajor<<16 | h.VMinor<<8 | h.VRev

@@ -106,3 +106,23 @@ jobs:
       - name: govulncheck
         if: success() || failure()
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Every supported PostgreSQL major: dump in every format, corrupt it, and
+  # check that clean dumps PASS and corrupted ones FAIL.
+  postgres-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["13", "14", "15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Integration tests against postgres:${{ matrix.pg }}
+        env:
+          XINPROOF_TEST_PG_IMAGE: postgres:${{ matrix.pg }}
+        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/

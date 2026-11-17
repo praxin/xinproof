@@ -1,14 +1,16 @@
-// Package postgres restores PostgreSQL dumps (custom format and plain SQL)
+// Package postgres restores PostgreSQL dumps (custom, tar, directory and plain SQL)
 // into a sandboxed postgres container and checks the result.
 package postgres
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +40,9 @@ type Engine struct {
 	CPUs      string        // e.g. "2"
 	TmpfsSize string        // if set, keep the dump and data directory on a tmpfs of this size
 	TTL       time.Duration // reaper deadline for containers
+	// AmcheckBudget limits B-tree index verification (amcheck) per database;
+	// 0 disables it. Indexes are checked largest first.
+	AmcheckBudget time.Duration
 
 	seq       atomic.Int64
 	availOnce sync.Once
@@ -45,12 +50,19 @@ type Engine struct {
 }
 
 func (e *Engine) Supports(d discover.Detection) bool {
-	return d.Format == discover.FormatPGCustom || d.Format == discover.FormatPGPlain
+	switch d.Format {
+	case discover.FormatPGCustom, discover.FormatPGPlain, discover.FormatPGTar, discover.FormatPGDir:
+		return true
+	}
+	return false
 }
 
 func (e *Engine) Analyzer(d discover.Detection) engine.Analyzer {
-	if d.Format == discover.FormatPGPlain {
+	switch d.Format {
+	case discover.FormatPGPlain:
 		return NewPlainAnalyzer()
+	case discover.FormatPGTar:
+		return NewTarAnalyzer()
 	}
 	return nil
 }
@@ -124,7 +136,7 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 	}
 	spec.Env = env
 	c, err := e.Docker.Run(ctx, spec)
-	s := &session{c: c, image: ref, det: d}
+	s := &session{c: c, image: ref, det: d, amcheck: e.AmcheckBudget}
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -137,10 +149,11 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 }
 
 type session struct {
-	c     *sandbox.Container
-	image string
-	det   discover.Detection
-	once  sync.Once
+	c       *sandbox.Container
+	image   string
+	det     discover.Detection
+	amcheck time.Duration
+	once    sync.Once
 }
 
 func (s *session) Image() string { return s.image }
@@ -178,11 +191,19 @@ func (s *session) waitReady(ctx context.Context, max time.Duration) error {
 }
 
 func (s *session) Upload(ctx context.Context) (io.WriteCloser, func() error) {
+	return s.upload(ctx, "mkdir -p /xinproof && cat > "+dumpPath)
+}
+
+func (s *session) UploadDir(ctx context.Context) (io.WriteCloser, func() error) {
+	return s.upload(ctx, "mkdir -p "+dumpPath+" && tar -x -f - -C "+dumpPath)
+}
+
+func (s *session) upload(ctx context.Context, script string) (io.WriteCloser, func() error) {
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
 		res, err := s.c.Exec(ctx, sandbox.ExecOpts{
-			Args:  []string{"sh", "-c", "mkdir -p /xinproof && cat > " + dumpPath},
+			Args:  []string{"sh", "-c", script},
 			Stdin: pr,
 		})
 		if err == nil && res.ExitCode != 0 {
@@ -209,7 +230,8 @@ func (s *session) psql(ctx context.Context, db, sql string) (sandbox.ExecResult,
 
 func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome {
 	var out engine.Outcome
-	expected := -1
+	expectedTables := -1
+	var dumpRows map[string]int64 // rows per table in the dump; nil until known
 
 	errOut := func(reason string) engine.Outcome {
 		out.Result, out.Reason = receipt.Error, reason
@@ -229,7 +251,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 
 	var restoreArgs []string
 	switch s.det.Format {
-	case discover.FormatPGCustom:
+	case discover.FormatPGCustom, discover.FormatPGTar, discover.FormatPGDir:
 		res, err := s.exec(ctx, "pg_restore", "-l", dumpPath)
 		if err != nil {
 			return execErr(err, "reading the archive TOC")
@@ -241,7 +263,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 			return failOut("l2.toc", "archive TOC unreadable: "+firstErrors(res.Stderr))
 		}
 		tables, entries := CountTOC(string(res.Stdout))
-		expected = tables
+		expectedTables = tables
 		out.Checks = append(out.Checks, receipt.Check{ID: "l2.toc", Status: receipt.CheckPass,
 			Detail: fmt.Sprintf("%d TOC entries, %d tables", entries, tables)})
 		restoreArgs = []string{"pg_restore", "--exit-on-error", "--no-owner", "--no-acl",
@@ -250,7 +272,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	case discover.FormatPGPlain:
 		pa, _ := a.(*PlainAnalyzer)
 		if pa != nil {
-			expected = pa.Tables
+			expectedTables, dumpRows = pa.Tables, pa.Rows
 			if roles := pa.PlaceholderRoles(superuser); len(roles) > 0 {
 				var sql strings.Builder
 				for _, r := range roles {
@@ -290,71 +312,278 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	out.Checks = append(out.Checks, receipt.Check{ID: "l2.restore", Status: receipt.CheckPass,
 		Detail: fmt.Sprintf("exit 0 in %.1fs", dur.Seconds())})
 
-	tables, rows, err := s.inspect(ctx)
+	// For archive formats, count the rows the dump holds by replaying its data
+	// section as SQL (no restore, just decompression and counting).
+	if dumpRows == nil {
+		counter := NewPlainAnalyzer()
+		res, err := s.c.Exec(ctx, sandbox.ExecOpts{Args: []string{"pg_restore", "--data-only", "-f", "-", dumpPath}, Stdout: counter})
+		if err != nil {
+			return execErr(err, "reading the dump's data for the row audit")
+		}
+		if res.ExitCode != 0 {
+			return failOut("l2.rows", "the dump's data section can't be read: "+firstErrors(res.Stderr))
+		}
+		dumpRows = counter.Rows
+	}
+
+	dbs, tables, err := s.inspect(ctx)
 	if err != nil {
 		return execErr(err, "inspecting the restored database")
 	}
-	out.Tables, out.Rows, out.RowsKnown = tables, rows, true
+	out.Tables = len(tables)
+	for _, t := range tables {
+		if t.kind == 'r' {
+			out.Rows += t.rows
+		}
+	}
+	out.RowsKnown = true
 
 	switch {
-	case expected < 0:
-		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckInfo, Detail: fmt.Sprintf("%d tables", tables)})
-	case tables < expected:
-		return failOut("l2.objects", fmt.Sprintf("only %d of %d tables restored · %d tables lost", tables, expected, expected-tables))
-	case tables == expected:
-		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckPass, Detail: fmt.Sprintf("%d/%d tables", tables, expected)})
+	case expectedTables < 0:
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckInfo, Detail: fmt.Sprintf("%d tables", out.Tables)})
+	case out.Tables < expectedTables:
+		return failOut("l2.objects", fmt.Sprintf("only %d of %d tables restored · %d tables lost", out.Tables, expectedTables, expectedTables-out.Tables))
+	case out.Tables == expectedTables:
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckPass, Detail: fmt.Sprintf("%d/%d tables", out.Tables, expectedTables)})
 	default:
-		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckPass, Detail: fmt.Sprintf("%d tables (%d in dump)", tables, expected)})
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.objects", Status: receipt.CheckPass, Detail: fmt.Sprintf("%d tables (%d in dump)", out.Tables, expectedTables)})
 	}
-	out.Checks = append(out.Checks, receipt.Check{ID: "l2.rows", Status: receipt.CheckPass, Detail: fmt.Sprintf("%d rows (exact count)", rows)})
+
+	if problems := AuditRows(dumpRows, tables); len(problems) > 0 {
+		reason := strings.Join(problems[:min(3, len(problems))], "; ")
+		if len(problems) > 3 {
+			reason += fmt.Sprintf("; and %d more", len(problems)-3)
+		}
+		return failOut("l2.rows", "restored data doesn't match the dump: "+reason)
+	}
+	withData := 0
+	for _, n := range dumpRows {
+		if n > 0 {
+			withData++
+		}
+	}
+	out.Checks = append(out.Checks, receipt.Check{ID: "l2.rows", Status: receipt.CheckPass,
+		Detail: fmt.Sprintf("%d rows (exact count); all %d tables with data match the dump", out.Rows, withData)})
+
+	if h, err := s.schemaHash(ctx, dbs); err != nil {
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.schema_hash", Status: receipt.CheckError, Detail: "could not compute: " + err.Error()})
+	} else {
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.schema_hash", Status: receipt.CheckPass, Detail: "sha256:" + h})
+	}
+
+	if s.amcheck <= 0 {
+		out.Checks = append(out.Checks, receipt.Check{ID: "l2.amcheck", Status: receipt.CheckSkip, Detail: "disabled"})
+	} else {
+		checked, skipped, bad, err := s.runAmcheck(ctx, dbs)
+		switch {
+		case err != nil:
+			out.Checks = append(out.Checks, receipt.Check{ID: "l2.amcheck", Status: receipt.CheckError, Detail: "could not run: " + err.Error()})
+		case bad != "":
+			return failOut("l2.amcheck", "index corruption found by amcheck: "+clip(bad, 300))
+		default:
+			detail := fmt.Sprintf("%d B-tree indexes verified (bt_index_check with heapallindexed)", checked)
+			if skipped > 0 {
+				detail += fmt.Sprintf("; %d skipped over the %s budget", skipped, s.amcheck)
+			}
+			out.Checks = append(out.Checks, receipt.Check{ID: "l2.amcheck", Status: receipt.CheckPass, Detail: detail})
+		}
+	}
+
 	out.Result = receipt.Pass
 	return out
 }
 
-const inspectSQL = `SELECT count(*),
-  coalesce(sum(CASE WHEN c.relkind = 'r' THEN
-    (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', n.nspname, c.relname), false, true, '')))[1]::text::bigint
-  END), 0)
-FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p')
-  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-  AND n.nspname NOT LIKE 'pg\_toast%'
-  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')`
+// TableCount is one restored table.
+type TableCount struct {
+	DB, Qualified string // DB "" is the database the dump was restored into
+	kind          byte   // 'r' table, 'p' partitioned parent
+	rows          int64
+}
 
-// inspect counts user tables and exact rows across every database in the
+func NewTableCount(db, qualified string, kind byte, rows int64) TableCount {
+	return TableCount{DB: db, Qualified: qualified, kind: kind, rows: rows}
+}
+
+// AuditRows compares the rows each table holds in the dump with what was
+// restored and describes every table that lost rows.
+func AuditRows(dump map[string]int64, restored []TableCount) []string {
+	have := map[string]int64{}
+	for _, t := range restored {
+		have[TableKey(t.DB, t.Qualified)] = t.rows
+	}
+	keys := make([]string, 0, len(dump))
+	for k := range dump {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var problems []string
+	for _, k := range keys {
+		want := dump[k]
+		db, name := SplitTableKey(k)
+		if db != "" {
+			name = db + ":" + name
+		}
+		got, ok := have[k]
+		switch {
+		case !ok && want > 0:
+			problems = append(problems, fmt.Sprintf("%s has %d rows in the dump but is missing after restore", name, want))
+		case ok && got < want:
+			problems = append(problems, fmt.Sprintf("%s has %d rows in the dump, %d restored (−%d)", name, want, got, want-got))
+		}
+	}
+	return problems
+}
+
+const userSchemas = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%' AND n.nspname <> 'xinproof_amcheck'`
+
+const inspectSQL = `SELECT n.nspname, c.relname, c.relkind,
+  (xpath('/row/c/text()', query_to_xml(format(CASE WHEN c.relkind = 'r' THEN 'SELECT count(*) AS c FROM ONLY %I.%I' ELSE 'SELECT count(*) AS c FROM %I.%I' END,
+     n.nspname, c.relname), false, true, '')))[1]::text::bigint
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p') AND ` + userSchemas + `
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
+ORDER BY 1, 2`
+
+// inspect lists user tables with exact row counts in every database in the
 // sandbox (plain dumps made with -C or pg_dumpall create their own databases).
-func (s *session) inspect(ctx context.Context) (tables int, rows int64, err error) {
+func (s *session) inspect(ctx context.Context) (dbs []string, tables []TableCount, err error) {
 	res, err := s.psql(ctx, restoreDB, "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1")
 	if err != nil {
-		return 0, 0, err
+		return nil, nil, err
 	}
 	if res.ExitCode != 0 {
-		return 0, 0, errors.New(firstErrors(res.Stderr))
+		return nil, nil, errors.New(firstErrors(res.Stderr))
 	}
 	for _, db := range strings.Split(strings.TrimSpace(string(res.Stdout)), "\n") {
-		if db = strings.TrimSpace(db); db == "" {
-			continue
+		if db = strings.TrimSpace(db); db != "" {
+			dbs = append(dbs, db)
 		}
+	}
+	for _, db := range dbs {
 		r, err := s.psql(ctx, db, inspectSQL)
 		if err != nil {
-			return 0, 0, err
+			return nil, nil, err
 		}
 		if r.ExitCode != 0 {
-			return 0, 0, fmt.Errorf("database %s: %s", db, firstErrors(r.Stderr))
+			return nil, nil, fmt.Errorf("database %s: %s", db, firstErrors(r.Stderr))
 		}
-		t, n, ok := strings.Cut(strings.TrimSpace(string(r.Stdout)), "\t")
-		if !ok {
-			return 0, 0, fmt.Errorf("unexpected inspection output %q", r.Stdout)
+		key := db
+		if db == restoreDB {
+			key = ""
 		}
-		ti, err1 := strconv.Atoi(t)
-		ni, err2 := strconv.ParseInt(n, 10, 64)
-		if err1 != nil || err2 != nil {
-			return 0, 0, fmt.Errorf("unexpected inspection output %q", r.Stdout)
+		for _, line := range strings.Split(strings.TrimRight(string(r.Stdout), "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+			f := strings.Split(line, "\t")
+			if len(f) != 4 || len(f[2]) != 1 {
+				return nil, nil, fmt.Errorf("unexpected inspection output %q", line)
+			}
+			n, err := strconv.ParseInt(f[3], 10, 64)
+			if err != nil {
+				return nil, nil, fmt.Errorf("unexpected inspection output %q", line)
+			}
+			tables = append(tables, TableCount{DB: key, Qualified: f[0] + "." + f[1], kind: f[2][0], rows: n})
 		}
-		tables += ti
-		rows += ni
 	}
-	return tables, rows, nil
+	return dbs, tables, nil
+}
+
+const schemaHashSQL = `SELECT coalesce(encode(sha256(convert_to(string_agg(line, E'\n' ORDER BY line), 'UTF8')), 'hex'), '') FROM (
+  SELECT format('col %I.%I %s %I %s %s', n.nspname, c.relname, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull) AS line
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND ` + userSchemas + `
+  UNION ALL
+  SELECT format('con %I.%I %I %s', n.nspname, c.relname, co.conname, pg_get_constraintdef(co.oid))
+    FROM pg_constraint co JOIN pg_class c ON c.oid = co.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE ` + userSchemas + `
+  UNION ALL
+  SELECT format('idx %s', pg_get_indexdef(i.indexrelid))
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE ` + userSchemas + `
+) s`
+
+// schemaHash fingerprints the restored schema (columns, types, constraints,
+// indexes) across all databases. The same dump always yields the same hash,
+// so a change between backups shows up as a different hash.
+func (s *session) schemaHash(ctx context.Context, dbs []string) (string, error) {
+	var lines []string
+	for _, db := range dbs {
+		r, err := s.psql(ctx, db, schemaHashSQL)
+		if err != nil {
+			return "", err
+		}
+		if r.ExitCode != 0 {
+			return "", fmt.Errorf("database %s: %s", db, firstErrors(r.Stderr))
+		}
+		h := strings.TrimSpace(string(r.Stdout))
+		if h == "" {
+			continue // no user objects
+		}
+		name := db
+		if db == restoreDB {
+			name = ""
+		}
+		lines = append(lines, name+" "+h)
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+const amcheckSQL = `CREATE SCHEMA IF NOT EXISTS xinproof_amcheck;
+CREATE EXTENSION IF NOT EXISTS amcheck SCHEMA xinproof_amcheck;
+CREATE FUNCTION pg_temp.xinproof_amcheck(budget interval) RETURNS TABLE(checked int, skipped int, failed text) LANGUAGE plpgsql AS $fn$
+DECLARE
+  r record; t0 timestamptz := clock_timestamp(); bad text[] := '{}'; n int := 0; s int := 0;
+  ext text := (SELECT ns.nspname FROM pg_extension e JOIN pg_namespace ns ON ns.oid = e.extnamespace WHERE e.extname = 'amcheck');
+BEGIN
+  FOR r IN SELECT c.oid, c.oid::regclass::text AS name
+      FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE am.amname = 'btree' AND c.relpersistence <> 't' AND i.indisready AND i.indisvalid AND ` + userSchemas + `
+      ORDER BY c.relpages DESC, 2
+  LOOP
+    IF clock_timestamp() - t0 > budget THEN s := s + 1; CONTINUE; END IF;
+    BEGIN
+      EXECUTE format('SELECT %I.bt_index_check($1, true)', ext) USING r.oid;
+    EXCEPTION WHEN others THEN
+      bad := bad || (r.name || ': ' || SQLERRM);
+    END;
+    n := n + 1;
+  END LOOP;
+  RETURN QUERY SELECT n, s, array_to_string(bad, ' | ');
+END
+$fn$;
+SELECT * FROM pg_temp.xinproof_amcheck(make_interval(secs => BUDGET_SECONDS));`
+
+// runAmcheck verifies every B-tree index (structure and that every heap tuple
+// is indexed) in every database, within the time budget.
+func (s *session) runAmcheck(ctx context.Context, dbs []string) (checked, skipped int, bad string, err error) {
+	var bads []string
+	for _, db := range dbs {
+		r, err := s.psql(ctx, db, strings.Replace(amcheckSQL, "BUDGET_SECONDS", strconv.Itoa(int(s.amcheck.Seconds())), 1))
+		if err != nil {
+			return 0, 0, "", err
+		}
+		if r.ExitCode != 0 {
+			return 0, 0, "", fmt.Errorf("database %s: %s", db, firstErrors(r.Stderr))
+		}
+		f := strings.SplitN(strings.TrimRight(string(r.Stdout), "\n"), "\t", 3)
+		if len(f) != 3 {
+			return 0, 0, "", fmt.Errorf("unexpected amcheck output %q", r.Stdout)
+		}
+		c, _ := strconv.Atoi(f[0])
+		sk, _ := strconv.Atoi(f[1])
+		checked += c
+		skipped += sk
+		if f[2] != "" {
+			if db != restoreDB {
+				f[2] = db + ": " + f[2]
+			}
+			bads = append(bads, f[2])
+		}
+	}
+	return checked, skipped, strings.Join(bads, " | "), nil
 }
 
 // CountTOC counts table definitions and total entries in `pg_restore -l` output.

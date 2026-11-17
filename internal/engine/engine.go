@@ -34,6 +34,9 @@ type Session interface {
 	// Upload returns a writer for the decompressed dump and a wait function
 	// that returns once the sandbox has stored it.
 	Upload(ctx context.Context) (io.WriteCloser, func() error)
+	// UploadDir is like Upload, but takes a tar stream of a dump directory
+	// (pg_dump -Fd), which the sandbox unpacks.
+	UploadDir(ctx context.Context) (io.WriteCloser, func() error)
 	// Restore restores the uploaded dump and runs the checks.
 	Restore(ctx context.Context, a Analyzer) Outcome
 	// Close destroys the sandbox. It must be safe to call on any path.

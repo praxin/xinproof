@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"strings"
@@ -68,6 +69,22 @@ func lz(b []byte) []byte {
 	return out.Bytes()
 }
 
+// withFormat returns a copy of a PGDMP header with its archive-format byte changed.
+func withFormat(h []byte, f byte) []byte {
+	c := append([]byte(nil), h...)
+	c[10] = f
+	return c
+}
+
+func tarOf(name string, body []byte) []byte {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(body)), Typeflag: tar.TypeReg})
+	tw.Write(body)
+	tw.Close()
+	return b.Bytes()
+}
+
 func TestSniff(t *testing.T) {
 	hdr15 := pgdmpHeader(15, "16.4 (Debian 16.4-1.pgdg120+1)", "16.4 (Debian 16.4-1.pgdg120+1)")
 	hdr14 := pgdmpHeader(14, "13.11", "14.9")
@@ -84,7 +101,14 @@ func TestSniff(t *testing.T) {
 		{name: "pg custom 1.14", in: hdr14, format: FormatPGCustom, dumpVersion: "14.9", server: "13.11"},
 		{name: "pg custom truncated header", in: hdr15[:30], format: FormatPGCustom, problem: "truncated"},
 		{name: "pg custom bad int size", in: append([]byte("PGDMP\x01\x0f\x00\x63\x08\x01"), make([]byte, 64)...), format: FormatPGCustom, problem: "corrupt"},
-		{name: "pg custom tar format byte", in: append([]byte("PGDMP\x01\x0f\x00\x04\x08\x03"), make([]byte, 64)...), format: FormatPGCustom, problem: "not the custom format"},
+		{name: "pg_dump null format byte", in: append([]byte("PGDMP\x01\x0f\x00\x04\x08\x04"), make([]byte, 64)...), format: FormatPGCustom, problem: "unknown archive format 4"},
+		{name: "pg_dump unknown format byte", in: append([]byte("PGDMP\x01\x0f\x00\x04\x08\x09"), make([]byte, 64)...), format: FormatPGCustom, problem: "unknown archive format 9"},
+		{name: "directory toc.dat (pg_dump writes format 3)", in: withFormat(hdr15, 3), format: FormatPGDir, dumpVersion: "16.4"},
+		{name: "directory toc.dat (format 5)", in: withFormat(hdr15, 5), format: FormatPGDir, dumpVersion: "16.4"},
+		{name: "pg_dump tar", in: tarOf("toc.dat", withFormat(hdr15, 3)), format: FormatPGTar, dumpVersion: "16.4"},
+		{name: "gzipped pg_dump tar", in: gz(tarOf("toc.dat", withFormat(hdr15, 3))), format: FormatPGTar, comp: Gzip, dumpVersion: "16.4"},
+		{name: "tar with wrong toc format", in: tarOf("toc.dat", hdr15), format: FormatPGTar, problem: "expected tar"},
+		{name: "other tarball", in: tarOf("index.html", []byte("<html>")), format: FormatUnknown, problem: "not a pg_dump tar-format archive"},
 		{name: "pg plain", in: []byte(plainPG), format: FormatPGPlain, dumpVersion: "16.4", server: "16.4"},
 		{name: "pg plain with BOM", in: append([]byte("\xef\xbb\xbf"), plainPG...), format: FormatPGPlain, dumpVersion: "16.4"},
 		{name: "pg_dumpall", in: []byte("--\n-- PostgreSQL database cluster dump\n--\n\n-- Dumped by pg_dumpall version 17.2\n"), format: FormatPGPlain, dumpVersion: "17.2"},
@@ -143,6 +167,17 @@ func TestIsCandidate(t *testing.T) {
 		if got := IsCandidate(name); got != want {
 			t.Errorf("IsCandidate(%q) = %v, want %v", name, got, want)
 		}
+	}
+	for name, want := range map[string]bool{"shop.tar": true, "shop.tar.gz": true, "shop.tgz": true, "shop.tar.zst": true, "shop.dump": false, "notes.txt": false} {
+		if got := IsTarCandidate(name); got != want {
+			t.Errorf("IsTarCandidate(%q) = %v, want %v", name, got, want)
+		}
+	}
+	if !IsDirectoryTOC("x/y/toc.dat") || IsDirectoryTOC("toc.dat.gz") {
+		t.Error("IsDirectoryTOC")
+	}
+	if MemberCompression("3301.dat.gz") != Gzip || MemberCompression("3301.dat.zst") != Zstd || MemberCompression("toc.dat") != None {
+		t.Error("MemberCompression")
 	}
 	if target, ok := IsSidecar("a/pg.dump.sha256"); !ok || target != "a/pg.dump" {
 		t.Errorf("IsSidecar = %q %v", target, ok)
