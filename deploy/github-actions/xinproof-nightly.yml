@@ -1,0 +1,113 @@
+# Xinproof nightly backup verification, run in YOUR GitHub account.
+#
+# Copy this file to .github/workflows/xinproof-nightly.yml in any private repo
+# you own, keep the sections for the clouds you use, and set the repository
+# variables they reference (Settings -> Secrets and variables -> Actions ->
+# Variables). The cloud identities are read-only and keyless (OIDC): no
+# credentials are stored. Setup for each cloud: deploy/identities/.
+#
+# Your backups are restored inside this GitHub runner, in throwaway Docker
+# sandboxes with no network, and deleted at the end of the job. Receipts
+# contain sizes, hashes, row counts and check results, never row data.
+#
+# A broken backup fails the job, so GitHub emails you (Settings ->
+# Notifications -> Actions). Receipts are kept as a build artifact for 90 days.
+name: xinproof-nightly
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # every night at 02:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # keyless sign-in to AWS / Azure / Google Cloud
+
+env:
+  XINPROOF_VERSION: "0.1.0" # pin; update deliberately
+  ARGS: "--newest 3 --format junit" # newest 3 backups per location
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - run: mkdir -p reports receipts
+      - name: Install xinproof
+        run: |
+          base=https://github.com/praxin/xinproof/releases/download/v${XINPROOF_VERSION}
+          f=xinproof_${XINPROOF_VERSION}_linux_amd64.tar.gz
+          curl -fsSLO "$base/$f" && curl -fsSLO "$base/checksums.txt"
+          grep " $f\$" checksums.txt | sha256sum -c -
+          tar -xzf "$f" && sudo install "${f%.tar.gz}/xinproof" /usr/local/bin/xinproof
+          xinproof version
+
+      # Use one signing key for every run, so an auditor can pin a single
+      # public key. Generate it once with `xinproof key` on your machine, then
+      # store ~/.xinproof/keys/ed25519.key as the XINPROOF_KEY secret:
+      #   gh secret set XINPROOF_KEY < ~/.xinproof/keys/ed25519.key
+      # Without it, each run signs with a new throwaway key.
+      - name: Signing key
+        env:
+          XINPROOF_KEY: ${{ secrets.XINPROOF_KEY }}
+        run: |
+          if [ -n "$XINPROOF_KEY" ]; then
+            mkdir -p ~/.xinproof/keys
+            printf '%s\n' "$XINPROOF_KEY" > ~/.xinproof/keys/ed25519.key
+            chmod 600 ~/.xinproof/keys/ed25519.key
+          fi
+
+      # ---------- AWS S3 (delete if unused) ----------
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: vars.XINPROOF_AWS_ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ vars.XINPROOF_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.XINPROOF_AWS_REGION || 'us-east-1' }}
+      - name: Verify AWS backups
+        if: ${{ !cancelled() && vars.XINPROOF_AWS_LOCATION != '' }}
+        run: xinproof verify "${{ vars.XINPROOF_AWS_LOCATION }}" $ARGS --output reports/aws.xml --receipts receipts/aws
+
+      # ---------- Azure Blob (delete if unused) ----------
+      - uses: azure/login@v2
+        if: ${{ !cancelled() && vars.XINPROOF_AZURE_CLIENT_ID != '' }}
+        with:
+          client-id: ${{ vars.XINPROOF_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.XINPROOF_AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.XINPROOF_AZURE_SUBSCRIPTION_ID }}
+      - name: Verify Azure backups
+        if: ${{ !cancelled() && vars.XINPROOF_AZURE_LOCATION != '' }}
+        run: xinproof verify "${{ vars.XINPROOF_AZURE_LOCATION }}" $ARGS --output reports/azure.xml --receipts receipts/azure
+
+      # ---------- Google Cloud Storage (delete if unused) ----------
+      - uses: google-github-actions/auth@v2
+        if: ${{ !cancelled() && vars.XINPROOF_GCP_WIF_PROVIDER != '' }}
+        with:
+          workload_identity_provider: ${{ vars.XINPROOF_GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.XINPROOF_GCP_SERVICE_ACCOUNT }}
+      - name: Verify Google Cloud backups
+        if: ${{ !cancelled() && vars.XINPROOF_GCP_LOCATION != '' }}
+        run: xinproof verify "${{ vars.XINPROOF_GCP_LOCATION }}" $ARGS --output reports/gcp.xml --receipts receipts/gcp
+
+      # ---------- Results ----------
+      - name: Keep receipts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinproof-receipts-${{ github.run_id }}
+          path: |
+            receipts/
+            reports/
+          retention-days: 90
+
+      # Optional: send the signed receipts to Xinproof Cloud (dashboard,
+      # history, alerts). Receipts carry no row data.
+      - name: Send receipts to Xinproof Cloud
+        if: ${{ !cancelled() && vars.XINPROOF_CLOUD_URL != '' }}
+        env:
+          TOKEN: ${{ secrets.XINPROOF_CLOUD_TOKEN }}
+        run: |
+          for f in receipts/*/receipt-*.json; do
+            [ -e "$f" ] || continue
+            curl -fsS -X POST "${{ vars.XINPROOF_CLOUD_URL }}/api/v1/receipts" \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data-binary @"$f"
+          done
