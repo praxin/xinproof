@@ -38,7 +38,8 @@ import (
 	"github.com/praxin/xinproof/internal/verify"
 )
 
-const version = "0.1.0"
+// version is set at release time: -ldflags "-X main.version=1.2.3".
+var version = "0.1.0-dev"
 
 // Exit codes (design doc §6).
 const (

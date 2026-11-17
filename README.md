@@ -57,11 +57,20 @@ Measured on a laptop (WSL2, Docker Engine): an 8.8 GB PostgreSQL 16 database (57
 ## Requirements
 - Docker: Docker Engine on Linux; Docker Desktop (or colima, etc.) on macOS; Docker Desktop with WSL2 on Windows.
 - Read-only access to wherever the backups live.
-- Building from source: Go (version in `go.mod`).
+## Install
+- **Binary:** download `xinproof_<version>_<os>_<arch>.tar.gz` for Linux or macOS (amd64, arm64) from the GitHub Releases page and check it against `checksums.txt`.
+- **Docker:** the image needs the host's Docker socket, because it restores backups in sibling containers:
+  ```bash
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$PWD/receipts:/work/receipts" -v "$HOME/.xinproof:/root/.xinproof" \
+    ghcr.io/praxin/xinproof verify s3://bucket/prefix/
+  ```
+- **From source** (Go version in `go.mod`):
+  ```bash
+  go build -o bin/xinproof ./cmd/xinproof
+  ```
 
-```bash
-go build -o bin/xinproof ./cmd/xinproof
-```
+Releases are cut by pushing a `v*` tag (`.github/workflows/release.yml`); running that workflow by hand is a dry run that builds and smoke-tests everything without publishing.
 
 ## Usage
 
@@ -128,4 +137,4 @@ bash scripts/demo.sh                       # one good + one truncated dump, end 
 CI (`.github/workflows/ci.yml`) runs a `go mod tidy` drift check, cross-builds, vet, gofmt, race-enabled unit tests, the storage conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), restores against every supported PostgreSQL (13–18), MySQL (8.0, 8.4) and MariaDB (10.11, 11.4), the chaos tests, the demo, the JSON/JUnit report checks and govulncheck on every push.
 
 ## License
-Apache-2.0 (planned)
+[Apache-2.0](LICENSE)
