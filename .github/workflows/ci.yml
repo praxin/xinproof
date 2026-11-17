@@ -77,9 +77,9 @@ jobs:
         if: success() || failure()
         run: go test -race -short -count=1 ./...
 
-      - name: Integration tests (real Postgres and MySQL in Docker)
+      - name: Integration tests (real Postgres, MySQL and MongoDB in Docker)
         if: success() || failure()
-        run: go test -count=1 -v -run 'TestReal|Extension' ./internal/engine/postgres/ ./internal/engine/mysql/
+        run: go test -count=1 -v -run 'TestReal|Extension' ./internal/engine/postgres/ ./internal/engine/mysql/ ./internal/engine/mongodb/
 
       - name: Storage backends against emulators (SeaweedFS S3, Azurite, fake-gcs-server)
         if: success() || failure()
@@ -162,3 +162,23 @@ jobs:
         env:
           XINPROOF_TEST_MYSQL_IMAGE: ${{ matrix.image }}
         run: go test -count=1 -v -timeout 25m -run 'TestReal' ./internal/engine/mysql/
+
+  # MongoDB: real mongodump --archive output (plain and --gzip), clean and corrupted,
+  # dumped by and restored into each image.
+  mongodb-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mongo:6.0", "mongo:7", "mongo:8.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Integration tests against ${{ matrix.image }}
+        env:
+          XINPROOF_TEST_MONGO_IMAGE: ${{ matrix.image }}
+        run: go test -count=1 -v -timeout 25m -run 'TestReal' ./internal/engine/mongodb/

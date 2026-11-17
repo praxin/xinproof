@@ -21,6 +21,8 @@ var sandboxFaults = []struct{ needle, reason string }{
 	{"can't connect to mysql server", "the sandbox database stopped accepting connections during restore"},
 	{"can't connect to local server", "the sandbox database stopped accepting connections during restore"},
 	{"got error 28 ", "the sandbox ran out of disk space (use a bigger --tmpfs, or none)"},
+	// MongoDB refuses index builds with less than 500 MB free.
+	{"(outofdiskspace)", "the sandbox ran out of disk space (MongoDB needs 500 MB free to build indexes; use a bigger --tmpfs, or none)"},
 }
 
 // SandboxFault returns why a tool failure was the sandbox's fault (→ ERROR),

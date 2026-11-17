@@ -181,6 +181,8 @@ func TestIsCandidate(t *testing.T) {
 		"receipts/HEAD":       false,
 		"image.png":           false,
 		"x.gz":                false,
+		"mongo.archive":       true,
+		"mongo.archive.gz":    true,
 	}
 	for name, want := range tests {
 		if got := IsCandidate(name); got != want {
