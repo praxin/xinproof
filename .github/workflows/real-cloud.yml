@@ -3,6 +3,7 @@
 # dumps (two good, one truncated) and a read-only identity:
 #   AWS S3         read-only IAM user (access key in secrets)
 #   Azure Blob     GitHub OIDC -> Entra app with Storage Blob Data Reader
+#   Google Cloud   GitHub OIDC -> workload identity -> objectViewer on one bucket
 #   Cloudflare R2  read-only R2 token scoped to one bucket (in secrets)
 # A cloud whose secrets/variables aren't set is skipped, not failed.
 name: real-cloud
@@ -16,7 +17,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Azure sign-in without a stored secret
+  id-token: write # Azure and Google Cloud sign-in without a stored secret
 
 concurrency:
   group: real-cloud-${{ github.ref }}
@@ -30,6 +31,7 @@ jobs:
       HAS_AWS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && vars.AWS_TEST_LOCATION != '' }}
       HAS_AZURE: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TEST_LOCATION != '' }}
       HAS_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' && vars.R2_ACCOUNT_ID != '' }}
+      HAS_GCP: ${{ vars.GCP_WIF_PROVIDER != '' && vars.GCP_TEST_LOCATION != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -61,6 +63,17 @@ jobs:
         if: ${{ !cancelled() && steps.azlogin.outcome == 'success' }}
         run: bash scripts/real-cloud.sh "${{ vars.AZURE_TEST_LOCATION }}"
 
+      - name: Google Cloud sign-in (workload identity federation, no stored secret)
+        id: gcplogin
+        if: ${{ !cancelled() && env.HAS_GCP == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Google Cloud Storage (objectViewer on one bucket, via the sign-in above)
+        if: ${{ !cancelled() && steps.gcplogin.outcome == 'success' }}
+        run: bash scripts/real-cloud.sh "${{ vars.GCP_TEST_LOCATION }}"
+
       - name: Cloudflare R2 (read-only token, one bucket)
         if: ${{ !cancelled() && env.HAS_R2 == 'true' }}
         env:
@@ -69,7 +82,7 @@ jobs:
         run: bash scripts/real-cloud.sh "${{ vars.R2_TEST_LOCATION }}" --r2-account-id "${{ vars.R2_ACCOUNT_ID }}"
 
       - name: Clouds skipped (missing secrets or variables)
-        if: ${{ !cancelled() && (env.HAS_AWS != 'true' || env.HAS_AZURE != 'true' || env.HAS_R2 != 'true') }}
+        if: ${{ !cancelled() && (env.HAS_AWS != 'true' || env.HAS_AZURE != 'true' || env.HAS_GCP != 'true' || env.HAS_R2 != 'true') }}
         run: |
-          echo "AWS: $HAS_AWS  Azure: $HAS_AZURE  R2: $HAS_R2"
+          echo "AWS: $HAS_AWS  Azure: $HAS_AZURE  GCP: $HAS_GCP  R2: $HAS_R2"
           echo "::notice::Some real-cloud checks were skipped because their secrets or variables aren't set."
