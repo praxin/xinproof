@@ -162,3 +162,17 @@ jobs:
         env:
           XINPROOF_TEST_MYSQL_IMAGE: ${{ matrix.image }}
         run: go test -count=1 -v -timeout 25m -run 'TestReal' ./internal/engine/mysql/
+
+  cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: cloud
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Xinproof Cloud tests (Worker against in-memory SQLite)
+        run: npm test

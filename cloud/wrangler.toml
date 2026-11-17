@@ -1,0 +1,19 @@
+# Xinproof Cloud v0. Deploy: see README.md. Runs on the Workers free plan.
+name = "xinproof-cloud"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "xinproof-cloud"
+database_id = "REPLACE_AFTER_wrangler_d1_create"
+
+[triggers]
+crons = ["*/30 * * * *"] # stale-backup check
+
+[vars]
+PUBLIC_URL = "" # e.g. https://xinproof-cloud.<account>.workers.dev, used in cron alert links
+
+# Secrets (wrangler secret put): SESSION_SECRET, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
+# Local dev: put them, plus DEV_LOGIN = "1", in .dev.vars (gitignored).

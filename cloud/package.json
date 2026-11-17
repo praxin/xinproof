@@ -1,0 +1,14 @@
+{
+  "name": "xinproof-cloud",
+  "private": true,
+  "type": "module",
+  "description": "Xinproof Cloud v0: receipt hub (Cloudflare Worker + D1). No runtime dependencies.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "dev": "npx wrangler@4 dev",
+    "db:init": "npx wrangler@4 d1 execute xinproof-cloud --remote --file schema.sql",
+    "deploy": "npx wrangler@4 deploy"
+  },
+  "engines": { "node": ">=22.5" }
+}
