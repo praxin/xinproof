@@ -242,7 +242,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	docker := &sandbox.Docker{Bin: *dockerBin, Log: logger}
 	if docker.Available(ctx) == nil {
 		if n, _ := docker.Reap(ctx); n > 0 {
-			fmt.Fprintf(humanOut, "  removed %d expired sandbox container(s) from an earlier run\n", n)
+			fmt.Fprintf(humanOut, "  removed %d leftover sandbox container(s) from an earlier run\n", n)
 		}
 	}
 	runID := randomID()

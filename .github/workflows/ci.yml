@@ -79,7 +79,7 @@ jobs:
 
       - name: Integration tests (real Postgres and MySQL in Docker)
         if: success() || failure()
-        run: go test -count=1 -v -run 'TestReal' ./internal/engine/postgres/ ./internal/engine/mysql/
+        run: go test -count=1 -v -run 'TestReal|Extension' ./internal/engine/postgres/ ./internal/engine/mysql/
 
       - name: Storage backends against emulators (SeaweedFS S3, Azurite, fake-gcs-server)
         if: success() || failure()

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,7 +140,7 @@ func (e *Engine) Start(ctx context.Context, d discover.Detection) (engine.Sessio
 	}
 	spec.Env = env
 	c, err := e.Docker.Run(ctx, spec)
-	s := &session{c: c, image: ref, det: d, amcheck: e.AmcheckBudget, hooks: e.Hooks}
+	s := &session{c: c, image: ref, det: d, amcheck: e.AmcheckBudget, hooks: e.Hooks, jobs: restoreJobs(e.CPUs)}
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -157,7 +158,17 @@ type session struct {
 	det     discover.Detection
 	amcheck time.Duration
 	hooks   engine.Hooks
+	jobs    int // pg_restore -j for formats that support parallel restore
 	once    sync.Once
+}
+
+// restoreJobs is the parallelism for pg_restore: the sandbox's CPU limit, 1–8.
+func restoreJobs(cpus string) int {
+	f, err := strconv.ParseFloat(strings.TrimSpace(cpus), 64)
+	if err != nil || f < 1 {
+		return 1
+	}
+	return min(int(f), 8)
 }
 
 // sandboxBroke reports, as an ERROR reason, whether a failed command failed
@@ -267,6 +278,7 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 	}
 
 	var restoreArgs []string
+	var required []string // extensions the dump creates
 	switch s.det.Format {
 	case discover.FormatPGCustom, discover.FormatPGTar, discover.FormatPGDir:
 		res, err := s.exec(ctx, "pg_restore", "-l", dumpPath)
@@ -286,13 +298,19 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 		expectedTables = tables
 		out.Checks = append(out.Checks, receipt.Check{ID: "l2.toc", Status: receipt.CheckPass,
 			Detail: fmt.Sprintf("%d TOC entries, %d tables", entries, tables)})
+		required = TOCExtensions(string(res.Stdout))
 		restoreArgs = []string{"pg_restore", "--exit-on-error", "--no-owner", "--no-acl",
-			"-h", "127.0.0.1", "-U", superuser, "-d", restoreDB, dumpPath}
+			"-h", "127.0.0.1", "-U", superuser, "-d", restoreDB}
+		if s.jobs > 1 && s.det.Format != discover.FormatPGTar { // tar archives can't be restored in parallel
+			restoreArgs = append(restoreArgs, "-j", strconv.Itoa(s.jobs))
+		}
+		restoreArgs = append(restoreArgs, dumpPath)
 
 	case discover.FormatPGPlain:
 		pa, _ := a.(*PlainAnalyzer)
 		if pa != nil {
 			expectedTables, dumpRows = pa.Tables, pa.Rows
+			required = pa.Extensions()
 			if roles := pa.PlaceholderRoles(superuser); len(roles) > 0 {
 				var sql strings.Builder
 				for _, r := range roles {
@@ -314,6 +332,15 @@ func (s *session) Restore(ctx context.Context, a engine.Analyzer) engine.Outcome
 
 	default:
 		return errOut("unsupported format " + string(s.det.Format))
+	}
+
+	// A dump that needs an extension the sandbox image lacks (PostGIS,
+	// TimescaleDB, pgvector, …) can't be tested here. That's the sandbox's
+	// limitation, not a broken backup, so it's an ERROR with advice.
+	if missing, err := s.missingExtensions(ctx, required); err != nil {
+		return execErr(err, "checking available extensions")
+	} else if len(missing) > 0 {
+		return errOut(missingExtensionsReason(missing, s.image, s.det))
 	}
 
 	if s.hooks.BeforeRestore != nil {
@@ -596,8 +623,8 @@ func firstErrors(stderr string) string {
 			continue
 		}
 		low := strings.ToLower(l)
-		if strings.Contains(low, "error") || strings.Contains(low, "fatal") {
-			picked = append(picked, l)
+		if (strings.Contains(low, "error") || strings.Contains(low, "fatal")) && !slices.Contains(picked, l) {
+			picked = append(picked, l) // parallel workers often repeat the same error
 		}
 		if len(picked) == 2 {
 			break

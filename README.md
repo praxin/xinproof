@@ -46,9 +46,13 @@ xinproof blames the backup only when the backup is at fault. Everything else is 
 | Sandbox database crashes (connection lost mid-restore) | ERROR, not FAIL |
 | Sandbox runs out of disk | ERROR `No space left on device` |
 | Restore exceeds `--timeout` | ERROR `… exceeded the time budget` |
+| Dump needs an extension the sandbox image lacks (PostGIS, TimescaleDB, pgvector, …) | ERROR naming the extension and an image to rerun with (`--pg-image`), never a FAIL |
 | Ctrl-C / SIGTERM | current restore stopped, its sandbox removed, every untested backup reported as ERROR with a receipt; exit 2 |
 | CLI killed with SIGKILL | the next run removes the orphaned sandbox at once (its owner process is gone; containers carry `xinproof.pid` / `xinproof.host` labels, plus an expiry for sandboxes started from other hosts) |
 | Killed between writing a receipt and updating `HEAD` | the next run notices, rebuilds `HEAD` from the receipts, and continues the chain |
+
+## Scale
+Measured on a laptop (WSL2, Docker Engine): an 8.8 GB PostgreSQL 16 database (57 M rows; a 690 MB custom-format dump) verifies with every check — restore, exact per-table row audit against the dump, schema hash, amcheck on all indexes — in **2m24s** with `--memory 4g --cpus 4` and **3m09s** with the defaults (2 GB, 2 CPUs). The CLI itself uses about 45 MB of memory; dumps are streamed, never held in memory. Custom and directory dumps restore in parallel (`pg_restore -j`, one job per sandbox CPU, up to 8).
 
 ## Requirements
 - Docker: Docker Engine on Linux; Docker Desktop (or colima, etc.) on macOS; Docker Desktop with WSL2 on Windows.

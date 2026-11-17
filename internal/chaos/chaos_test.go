@@ -159,7 +159,9 @@ func TestTimeBudgetExceeded(t *testing.T) {
 	d := needDocker(t)
 	dir := dumpsDir(t, map[string][]byte{"a.dump": pgDump(t, d), "b.dump": pgDump(t, d)})
 	runID := "chaos" + randHex(3)
-	eng := &postgres.Engine{Docker: d, RunID: runID, Image: pgImage, Memory: "1g", CPUs: "2", TTL: 20 * time.Minute}
+	// The hook guarantees the budget runs out mid-test however fast the machine is.
+	eng := &postgres.Engine{Docker: d, RunID: runID, Image: pgImage, Memory: "1g", CPUs: "2", TTL: 20 * time.Minute,
+		Hooks: engine.Hooks{BeforeRestore: func(string) { time.Sleep(3 * time.Second) }}}
 	for _, r := range runVerifier(t, engine.Multi{eng}, runID, dir, 2*time.Second) {
 		if r.Status != receipt.Error || !strings.Contains(r.Reason, "budget") {
 			t.Errorf("%s: %s %q, want ERROR for the exceeded budget", r.Object.Name, r.Status, r.Reason)

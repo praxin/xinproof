@@ -28,9 +28,10 @@ type PlainAnalyzer struct {
 
 	// Rows is the number of data rows the dump holds per table, keyed by
 	// TableKey(database, "schema.table"). Database is "" until a \connect.
-	Rows    map[string]int64
-	db      string
-	copyKey string
+	Rows       map[string]int64
+	extensions map[string]bool
+	db         string
+	copyKey    string
 }
 
 const maxLine = 1 << 20
@@ -73,6 +74,7 @@ func (a *PlainAnalyzer) appendLine(p []byte) {
 
 var (
 	reCreateTable = regexp.MustCompile(`^CREATE (?:UNLOGGED )?TABLE `)
+	reCreateExt   = regexp.MustCompile(`^CREATE EXTENSION (?:IF NOT EXISTS )?("(?:[^"]|"")+"|[A-Za-z0-9_-]+)`)
 	reOwnerTo     = regexp.MustCompile(`\bOWNER TO (.+);\s*$`)
 	reGrantTo     = regexp.MustCompile(`^GRANT .+? TO (.+);\s*$`)
 	reRevokeFrom  = regexp.MustCompile(`^REVOKE .+? FROM (.+);\s*$`)
@@ -103,6 +105,12 @@ func (a *PlainAnalyzer) processLine(l string) {
 	if strings.HasPrefix(l, `\connect `) || strings.HasPrefix(l, `\c `) {
 		a.db = parseConnect(l)
 		return
+	}
+	if m := reCreateExt.FindStringSubmatch(l); m != nil {
+		if a.extensions == nil {
+			a.extensions = map[string]bool{}
+		}
+		a.extensions[strings.Trim(m[1], `"`)] = true
 	}
 	if reCreateTable.MatchString(l) {
 		a.Tables++
