@@ -57,6 +57,7 @@ Usage:
   xinproof receipt verify [--pubkey K] <receipt.json>...
                                             check receipt signatures and chain offline
   xinproof key                              show (or create) this machine's signing key
+  xinproof agent                            run as a Xinproof Cloud runner (XINPROOF_URL, XINPROOF_RUNNER_TOKEN)
   xinproof version
 
 Locations:
@@ -96,6 +97,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	case "key":
 		return cmdKey(stdout, stderr)
+	case "agent":
+		return cmdAgent(args[1:], stdout, stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintf(stdout, "xinproof %s %s\n", version, commit())
 		return exitPass

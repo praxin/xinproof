@@ -106,13 +106,23 @@ func (h *Human) Footer(results []verify.Result, receiptsDir string) {
 		fmt.Fprintln(h.W, h.c(faint, "  signed receipts → "+span))
 		fmt.Fprintln(h.W, h.c(faint, "  check one: xinproof receipt verify "+rel(last)))
 	}
-	if verify.ExitCode(results) == 1 {
-		fmt.Fprintln(h.W, h.c(cyan, "  → Let Xinproof take over this backup: https://xinproof.dev"))
+	// One hint after a failure, for people running the CLI by hand. Hidden in
+	// runners (XINPROOF_URL is set: they already report somewhere) and when
+	// built with an empty CloudURL (e.g. for self-hosted installs).
+	if verify.ExitCode(results) == 1 && CloudURL != "" && os.Getenv("XINPROOF_URL") == "" {
+		fmt.Fprintln(h.W, h.c(cyan, "  → Have this checked every night, with fix guidance: "+CloudURL))
 	}
 }
 
+// CloudURL is Xinproof Cloud's address, shown in the hint above. Set at build
+// time with -ldflags "-X github.com/praxin/xinproof/internal/report.CloudURL=...";
+// empty hides the hint.
+var CloudURL = "https://xinproof-cloud.xinproof.workers.dev"
+
 func rel(p string) string {
-	if wd, err := os.Getwd(); err == nil {
+	// Under systemd the working directory is "/": a relative path would just
+	// drop the leading slash, so keep it absolute.
+	if wd, err := os.Getwd(); err == nil && wd != string(filepath.Separator) {
 		if r, err := filepath.Rel(wd, p); err == nil && !strings.HasPrefix(r, "..") {
 			return r
 		}

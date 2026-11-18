@@ -13,7 +13,7 @@ $ xinproof verify ./dumps/
   ✓ pg_2026-11-14.dump  3 tables  65.0K rows  0m00s
   signed receipts → receipts/receipt-000001.json … receipt-000002.json
   check one: xinproof receipt verify receipts/receipt-000002.json
-  → Let Xinproof take over this backup: https://xinproof.dev
+  → Have this checked every night, with fix guidance: https://xinproof-cloud.xinproof.workers.dev
 
 $ xinproof receipt verify receipts/*.json
 ✓ receipt-000001.json  signature valid (pinned: this machine's key) · chain intact (first receipt)
