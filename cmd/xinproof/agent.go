@@ -37,8 +37,10 @@ type agentJob struct {
 }
 
 type agentNext struct {
-	Job         *agentJob `json:"job"`
-	PollSeconds int       `json:"poll_seconds"`
+	Job          *agentJob `json:"job"`
+	PollSeconds  int       `json:"poll_seconds"`
+	LicenseError string    `json:"license_error"` // a self-hosted server without a valid licence says why
+	license      string    // the server's X-Xinproof-License header
 }
 
 // errStop means the cloud refused this runner (revoked key, changed signing
@@ -56,6 +58,9 @@ type agent struct {
 	client     *http.Client
 	out        io.Writer
 	verify     func(args []string) int // cmdVerify, swapped out in tests
+	license    string                  // the licence the server last presented
+	said       string                  // the last licence problem printed, to say it once
+	now        func() time.Time        // time.Now, swapped out in tests
 }
 
 func cmdAgent(args []string, stdout, stderr io.Writer) int {
@@ -176,6 +181,10 @@ func (a *agent) loop(ctx context.Context, once bool) error {
 		}
 		failures = 0
 		wait = time.Duration(max(next.PollSeconds, 10)) * time.Second
+		if next.LicenseError != "" && next.LicenseError != a.said {
+			fmt.Fprintf(a.out, "This Xinproof server isn't testing anything: %s\n", next.LicenseError)
+		}
+		a.said = next.LicenseError
 		if next.Job == nil {
 			if once {
 				return nil
@@ -224,6 +233,8 @@ func (a *agent) next(ctx context.Context) (*agentNext, error) {
 	if err := json.Unmarshal(b, &n); err != nil {
 		return nil, fmt.Errorf("unexpected reply: %w", err)
 	}
+	n.license = res.Header.Get("X-Xinproof-License")
+	a.license = n.license
 	return &n, nil
 }
 
@@ -271,6 +282,13 @@ func (a *agent) run(ctx context.Context, j *agentJob) {
 }
 
 func (a *agent) test(ctx context.Context, j *agentJob) (code, sent int, msg string) {
+	now := time.Now
+	if a.now != nil {
+		now = a.now
+	}
+	if err := serverLicense(a.url, a.license, now()); err != nil {
+		return exitUsage, 0, err.Error()
+	}
 	if err := a.acceptLocation(j.Location); err != nil {
 		return exitUsage, 0, err.Error()
 	}

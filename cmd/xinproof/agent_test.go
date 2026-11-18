@@ -22,6 +22,7 @@ type fakeCloud struct {
 	done     map[string]map[string]any
 	headers  http.Header
 	status   int
+	license  string // "" sends a valid test licence; "none" sends none
 }
 
 func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -38,6 +39,13 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var j *agentJob
 		if len(f.jobs) > 0 {
 			j, f.jobs = &f.jobs[0], f.jobs[1:]
+		}
+		switch f.license {
+		case "":
+			w.Header().Set("X-Xinproof-License", testLicense)
+		case "none":
+		default:
+			w.Header().Set("X-Xinproof-License", f.license)
 		}
 		json.NewEncoder(w).Encode(agentNext{Job: j, PollSeconds: 60})
 	case r.Method == "POST" && r.URL.Path == "/api/v1/receipts":
