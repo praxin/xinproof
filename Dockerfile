@@ -6,13 +6,16 @@
 #     ghcr.io/praxin/xinproof verify s3://bucket/prefix/
 #
 # Receipts are written to /work/receipts; the signing key lives in /root/.xinproof.
-FROM golang:1.26-alpine AS build
+# The Go build runs on the build machine's own architecture and cross-compiles
+# for the target, so multi-arch images don't compile under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG VERSION=0.1.0-dev
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /xinproof ./cmd/xinproof
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /xinproof ./cmd/xinproof
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates docker-cli tzdata
