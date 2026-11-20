@@ -1,10 +1,10 @@
-# Xinproof Verifier: engineering design (v0.1)
+# How xinproof works
 
-Status: draft · Owner: founder · Scope: the free "Verify your existing backups" tool, which is also the core engine of the paid product.
+This is the design of `xinproof verify`: what it promises, how a backup moves through it, and how failures are handled. For usage and flags, see the [README](../README.md); for the receipt format, see [RECEIPT-v1.md](RECEIPT-v1.md).
 
 ## 1. Goal
 
-Given a location holding existing database backups, prove whether each backup actually restores. Then emit a **signed, hash-chained proof receipt** for each one.
+Given a location holding existing database backups, prove whether each backup actually restores, and emit a **signed, hash-chained receipt** for each one.
 
 ```
 xinproof verify s3://acme-backups/postgres/
@@ -14,147 +14,90 @@ xinproof verify ./local-dumps/
 xinproof receipt verify receipt.json        # anyone can check a receipt
 ```
 
-**Non-goals for v1:** taking backups, bucket point-in-time recovery, the web UI, scheduling. Those belong to the full product and reuse this engine.
+Out of scope for `verify`: taking backups, and changing anything at the backup location. Scheduling is either your own (cron, CI, the [GitHub Actions template](../deploy/github-actions/xinproof-nightly.yml)) or `xinproof agent`, which runs `verify` on work it receives from Xinproof Cloud.
 
-## 2. Guarantees (the contract)
+## 2. Guarantees
 
-1. **Never silently partial.** Every discovered backup ends in exactly one of `PASS`, `FAIL`, or `ERROR` (meaning we couldn't test it, with the reason). The tool never says "done" for a backup it didn't test.
-2. **Read-only on the source.** It needs list and read permission only. It never writes, deletes or modifies source objects.
-3. **Isolated restores.** Each restore runs in a fresh container with **no network** and resource limits. The container is destroyed afterwards, even on crash (cleanup on start, labels, TTL reaper).
-4. **Data never leaves the machine running the CLI.** The free tool runs locally or in the customer's CI. The hosted version runs the same engine in our sandboxes.
-5. **Anyone can check a receipt** with the public key alone, offline.
+1. **Never silently partial.** Every backup found ends in exactly one of `PASS`, `FAIL` (it won't restore, with the reason) or `ERROR` (it couldn't be tested, with the reason). Each gets a receipt, including on Ctrl-C.
+2. **Read-only on the source.** Only list and read are ever called. Nothing is written, deleted or modified at the backup location.
+3. **Isolated restores.** Each restore runs in a fresh container with no network and resource limits, and is removed afterwards, including after a crash (cleanup on the next start, using container labels).
+4. **Data stays where the CLI runs.** Restores happen on the machine running `xinproof`. Receipts contain counts, hashes, versions, table names and results, never row data.
+5. **Anyone can check a receipt** offline, with only the public key.
+6. **Blame the backup only when it is at fault.** Problems with the environment (out of memory, a network drop, a missing extension, a timeout) are `ERROR`, not `FAIL`.
 
-## 3. Architecture
+## 3. Layout
 
 ```
-cmd/xinproof            CLI (cobra): verify, receipt verify, version
-internal/source         Storage abstraction: List(prefix) / Open(key) / Stat
-  ├─ s3                 AWS S3 + S3-compatible (R2, MinIO, Wasabi, B2): aws-sdk-go-v2
-  ├─ azblob             Azure Blob / ADLS Gen2: azure-sdk-for-go
-  ├─ gcs                Google Cloud Storage: cloud.google.com/go/storage
-  └─ local              Local filesystem (tests, offline use)
-internal/discover       Backup detection: magic bytes + extension + compression sniffing
-internal/sandbox        Container runtime: Docker Engine API (moby client); later Firecracker
-internal/engine
-  ├─ postgres           pg_restore / psql restore + checks
-  └─ mysql              mysql client restore + checks
-internal/checks         Check framework: L1 integrity, L2 restorability, L3 custom SQL
-internal/receipt        Canonical JSON (RFC 8785 JCS), Ed25519 sign/verify, hash chain
-internal/report         Human table, JSON, JUnit XML (for CI)
+cmd/xinproof            CLI: verify, receipt verify, key, agent, version
+internal/source         Read-only storage: List / Open / Stat
+  ├─ s3                 AWS S3 and S3-compatible stores (R2, MinIO, B2, Wasabi, Ceph, …)
+  ├─ azblob             Azure Blob Storage / ADLS Gen2
+  ├─ gcs                Google Cloud Storage
+  ├─ local              Local folders and files
+  └─ conformance        One test suite every backend must pass (run against emulators in CI)
+internal/discover       Backup detection by content: magic bytes, headers, compression
+internal/sandbox        Throwaway Docker containers with no network and limits
+internal/engine         Per-engine restore and checks
+  ├─ postgres           pg_restore / psql, amcheck, schema hash, extension detection
+  ├─ mysql              mysql / mariadb client, CHECK TABLE, schema hash
+  └─ mongodb            mongorestore, archive CRC checks, document counts
+internal/verify         Runs the pipeline for each backup, including custom checks
+internal/receipt        RFC 8785 canonical JSON, Ed25519 signing, hash chain
+internal/report         Human, JSON and JUnit output
+internal/chaos          Tests for crashes, kills, OOM, disk full and network drops
 ```
 
-### Data flow for one backup
-1. **Discover:** list the prefix. For each candidate object, read the first 64 KB to detect format:
-   - Postgres custom format: magic `PGDMP`.
-   - Plain SQL: a `-- PostgreSQL database dump` or `-- MySQL dump` header.
-   - Compression: gzip, zstd or lz4, by magic number.
-2. **L1 integrity:** stream the whole object and compute SHA-256 and size.
-   - If a checksum sidecar exists (`.sha256`, the S3 `ChecksumSHA256` attribute, or an Azure `Content-MD5`), compare against it.
-   - Decompress fully to catch truncated or corrupt archives (gzip CRC, zstd frame errors).
-   - For `PGDMP`, also parse the TOC with `pg_restore -l` inside the sandbox.
-3. **Sandbox:** start `postgres:<major>` or `mysql:<major>`, with the version taken from the dump header (`pg_dump` version / server version). Settings:
-   - `--network none`, a tmpfs data directory if size allows, memory and CPU limits, a random superuser password, and labels `xinproof.run=<id>`.
-4. **L2 restore:** stream the object into the container over its stdin (no temporary file on the host by default).
-   - Postgres custom format: `pg_restore --exit-on-error --no-owner --no-acl -d restore`.
-   - Plain SQL: `psql -v ON_ERROR_STOP=1`.
-   - Record the exit code, stderr and wall-clock **restore duration** (the measured RTO).
-5. **L2 checks:**
-   - Restored object counts vs the TOC: tables, sequences, indexes, functions.
-   - Row counts per table (exact `count(*)` up to a size budget, otherwise `pg_class.reltuples` estimates, flagged as such).
-   - Schema fingerprint: a SHA-256 of the normalized catalog query.
-   - Postgres: `amcheck` (`bt_index_check`) on B-tree indexes, within a time budget.
-   - Postgres: largest tables are non-empty if the TOC says they had data (`COPY` entries present).
-   - Truncation heuristic: a TOC entry with data but zero restored rows causes a FAIL with an explicit reason.
-6. **L3 custom checks (optional):** user SQL assertions from `xinproof.yaml`, for example `SELECT count(*) > 0 FROM orders WHERE created_at > now() - interval '1 day'`.
-7. **Receipt:** build the receipt, sign it, append it to the chain, write it out, then tear down the sandbox.
+## 4. One backup, start to finish
 
-## 4. Receipt format (v1)
+1. **Discover.** List the location and identify each object by its content, not its name: every `pg_dump` format (custom, tar, directory, plain SQL, `pg_dumpall`), `mysqldump` / `mariadb-dump`, and `mongodump --archive`, optionally wrapped in gzip, zstd or lz4. Other files are skipped.
+2. **L1 integrity.** Stream the object once: SHA-256 and size; compare with a `.sha256` sidecar or the provider's checksum when there is one (S3 `ChecksumSHA256`, Azure `Content-MD5`, GCS MD5/CRC32C); decompress everything; check the dump's own end markers (pg_dump's "dump complete" trailer, the tar end-of-archive marker, mysqldump's `-- Dump completed`, every MongoDB namespace closed and matching its CRC-64).
+3. **Sandbox.** Start the image that matches the version that made the dump (`postgres:<major>`, `mysql:<major.minor>`, `mariadb:<major.minor>`, `mongo:7`), pinned by digest, with no network, memory/CPU/PID limits, capabilities dropped and `no-new-privileges`. Durability is turned off because the data is thrown away.
+4. **L2 restore.** Stream the dump into the container and restore it, stopping at the first error (`pg_restore --exit-on-error`, `psql -v ON_ERROR_STOP=1`, the MySQL client, `mongorestore --stopOnError`). The wall-clock restore time is recorded as the measured RTO.
+5. **L2 checks.**
+   - Tables restored vs. the dump's table of contents.
+   - Row audit: the exact row count of every table (MongoDB: documents per collection) compared with what the dump contains. Any table that lost rows is a `FAIL`.
+   - Index integrity: Postgres `amcheck` on every B-tree index; MySQL `CHECK TABLE`. Both run within `--amcheck-budget`.
+   - Schema hash: a fingerprint of columns, types, constraints and indexes that is the same whatever the dump format.
+6. **L3 custom checks (optional).** Each `--check 'name=SQL'` runs in the restored database and must return one truthy value.
+7. **Receipt.** Build the receipt, sign it, chain it to the previous one, write it, then remove the sandbox.
 
-```json
-{
-  "schema": "xinproof.receipt/v1",
-  "id": "rcpt_01JD8Q4M7X…",            // ULID
-  "issued_at": "2026-11-16T14:21:07Z",
-  "subject": {
-    "source": "s3://acme-backups/postgres/pg_2026-11-16.dump",
-    "size": 13314398208,
-    "sha256": "…",
-    "etag": "…", "last_modified": "…"
-  },
-  "engine": { "kind": "postgres", "dump_version": "16.4", "sandbox_image": "postgres:16.4@sha256:…" },
-  "result": "PASS",                    // PASS | FAIL | ERROR
-  "measured": { "restore_seconds": 238.4, "total_seconds": 291.0 },
-  "checks": [
-    { "id": "l1.sha256", "status": "pass", "detail": "…" },
-    { "id": "l2.restore", "status": "pass", "detail": "exit 0" },
-    { "id": "l2.objects", "status": "pass", "detail": "214/214 tables" },
-    { "id": "l2.rows", "status": "pass", "detail": "38,212,904 rows" },
-    { "id": "l2.schema_hash", "status": "pass", "detail": "sha256:e1c9…" },
-    { "id": "l2.amcheck", "status": "pass", "detail": "412 indexes" }
-  ],
-  "tool": { "name": "xinproof", "version": "0.1.0", "commit": "…" },
-  "chain": { "prev": "sha256:7b01…44d0", "seq": 1284 },
-  "signature": { "alg": "ed25519", "key_id": "…", "sig": "base64…" }
-}
-```
+## 5. Receipts
 
-- **Signing:** `sig = Ed25519(private_key, JCS(receipt without "signature"))`.
-- **Chain:** `prev` is the SHA-256 of the previous receipt's canonical bytes, including its signature. A local `receipts/` store keeps the chain head. The hosted product keeps chains per tenant.
-- **Keys:**
-  - The free CLI generates a local key pair on first run (`~/.xinproof/keys`) and prints its fingerprint.
-  - The hosted service signs with keys held in KMS and published at `/.well-known/xinproof-keys.json`, with rotation and key IDs.
-- **Privacy:** receipts never contain row data, only counts, hashes and metadata. Table names can be hashed with `--redact-names`.
+Specified in [RECEIPT-v1.md](RECEIPT-v1.md). In short: the signature is Ed25519 over the RFC 8785 canonical JSON of the receipt without its `signature` field. `chain.prev` is the SHA-256 of the previous receipt's canonical bytes, including its signature. The CLI creates a key pair in `~/.xinproof/keys` on first run; `xinproof key` prints it.
 
-## 5. Credentials and security
+## 6. Credentials and security
 
-- **Credentials:** the standard credential chain for each cloud (AWS profile/role, Azure DefaultAzureCredential, GCP ADC). They're never written to disk or into receipts.
-- **Least-privilege examples ship in the docs:**
-  - S3: `s3:ListBucket` + `s3:GetObject` on the prefix.
-  - Azure: `Storage Blob Data Reader`.
-  - GCS: `storage.objects.list` / `get`.
-- **Untrusted input:** backups are untrusted. Restores happen only inside containers with no network, limits, and no host mounts other than a scratch tmpfs. The host never runs dump content.
-- **Supply chain:**
-  - Sandbox images are pinned by digest.
-  - Releases are built reproducibly, signed with cosign, and ship an SBOM.
+- **Credentials** come from each cloud's standard chain (AWS profiles and roles, Azure `DefaultAzureCredential`, Google Application Default Credentials). They are never written to disk or into receipts.
+- **Least privilege:** S3 `s3:ListBucket` + `s3:GetObject`; Azure `Storage Blob Data Reader` (or a read + list SAS); GCS `storage.objects.list` + `get`. The [deploy guide](../deploy/README.md) has keyless (OIDC) setups for each cloud.
+- **Backups are untrusted input.** Their contents only ever run inside the sandbox, never on the host.
 
-## 6. Failure model (explicit, tested)
+## 7. Failure model
 
-| Failure | Result | Reported reason |
-| --- | --- | --- |
-| Object truncated or corrupt compression | FAIL | "gzip stream ends early at byte N" |
-| `pg_restore` error | FAIL | first error lines from stderr |
-| TOC says data, table restored empty | FAIL | "table X expected data, restored 0 rows" |
-| Container can't start / Docker missing | ERROR | actionable message, never PASS |
-| Credential / permission denied | ERROR | which permission is missing |
-| Timeout (default 2 h, configurable) | ERROR | "restore exceeded 2h budget" |
-| CLI killed mid-run | no receipt; the sandbox is reaped on the next run | — |
+Each case below is covered by a test (`internal/chaos`, `internal/verify`).
 
-**Exit codes:** `0` all PASS · `1` any FAIL · `2` any ERROR · `3` usage error. This makes it usable directly in CI.
+| What happens | Result |
+| --- | --- |
+| Truncated or corrupt file, or broken compression | FAIL, with where it breaks |
+| Restore error | FAIL, with the first error lines |
+| A table restored with fewer rows than the dump holds | FAIL, naming the table |
+| Network drop while downloading | ERROR |
+| Sandbox killed, out of memory, or out of disk | ERROR, naming the cause |
+| Dump needs an extension the image lacks | ERROR, naming the extension and an image to use |
+| Restore exceeds `--timeout` (default 2h) | ERROR |
+| Ctrl-C or SIGTERM | current sandbox removed; every untested backup gets an ERROR receipt |
+| CLI killed with SIGKILL | the next run removes the leftover sandbox and repairs the chain head |
 
-## 7. Testing strategy (production-grade bar)
+**Exit codes:** `0` all PASS · `1` any FAIL · `2` any ERROR and no FAIL · `3` usage error.
 
-- **Unit:** format detection (golden files), canonical JSON, sign/verify, chain verification, report rendering.
-- **Integration (testcontainers-go):** MinIO plus real Postgres 13–17 and MySQL 8.0/8.4. Generate fixture databases, dump them, then corrupt them deliberately:
-  - truncate at 10% / 61% / 99%
-  - flip bytes
-  - drop a table's data section
-  - wrong-version dump
-  - empty file
+## 8. Testing
 
-  Every corruption **must** produce FAIL with the right reason. Every clean dump **must** PASS.
-- **Chaos:** kill the CLI mid-restore, then make sure the next run reaps the container and leaves no partial receipt.
-- **Cross-platform:** CI on Linux, macOS and Windows (with Docker Desktop).
-- **Golden receipts:** the receipt schema is versioned and tested for backward compatibility.
+- **Unit:** format detection, canonical JSON, signing and chains, reports. `go test -short ./...` needs no Docker.
+- **Restores:** real restores against every supported version (PostgreSQL 13–18, MySQL 8.0/8.4, MariaDB 10.11/11.4, MongoDB 6.0–8.0), with dumps corrupted on purpose (truncated, byte-flipped, missing data). Every corrupted dump must FAIL with the right reason, and every clean one must PASS.
+- **Storage:** one conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), plus a nightly run against real cloud buckets (AWS S3, Azure Blob, Google Cloud Storage, Cloudflare R2).
+- **Chaos:** the failure cases in §7.
 
-## 8. Milestones
+## 9. Known limits
 
-1. **M1:** CLI skeleton, local and S3 sources, Postgres custom and plain-SQL formats, the L1 and L2 restore/objects/rows checks, signed receipts plus `receipt verify`, and the integration tests above.
-2. **M2:** schema hash, `amcheck`, L3 custom SQL, JSON/JUnit output, the GitHub Action.
-3. **M3:** Azure Blob, GCS, R2/B2/Wasabi; MySQL engine.
-4. **M4:** open-source release (Apache-2.0), docs site, Show HN. A hosted "verify" web flow uses the same engine.
-
-## 9. Open decisions
-
-- **License:** Apache-2.0 for the verifier is recommended (trust and adoption). The hosted product stays proprietary.
-- **Large dumps (>100 GB):** sample-restore mode (schema plus the largest N tables) vs full restore. Default to full, and add sampling as an explicit flag.
-- **Windows-native without Docker:** out of scope. Document WSL2 or Docker Desktop as the requirement.
+- Logical dumps only. Physical backups (pgBackRest, WAL-G, XtraBackup) and managed-database snapshots are not supported.
+- Large dumps are always fully restored, so they need enough sandbox memory and disk (`--memory`, `--tmpfs`).
+- Windows runs through Docker Desktop with WSL2; there is no native Windows sandbox.
