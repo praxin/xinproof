@@ -20,7 +20,7 @@ $ xinproof receipt verify receipts/*.json
 ✓ receipt-000002.json  signature valid (pinned: this machine's key) · chain intact
 ```
 
-Status: pre-release (0.1.0). PostgreSQL (13–18), MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4) and MongoDB (`mongodump --archive` from MongoDB 6.0, 7, 8.0), from local folders, AWS S3, S3-compatible stores, Cloudflare R2, Azure Blob Storage / ADLS Gen2 and Google Cloud Storage. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
+Status: pre-release (0.2.0). PostgreSQL (13–18), MySQL / MariaDB (MySQL 8.0, 8.4; MariaDB 10.11, 11.4) and MongoDB (`mongodump --archive` from MongoDB 6.0, 7, 8.0), from local folders, AWS S3, S3-compatible stores, Cloudflare R2, Azure Blob Storage / ADLS Gen2 and Google Cloud Storage. See [docs/DESIGN-verifier.md](docs/DESIGN-verifier.md).
 
 ## What it does
 1. **Finds** the backups at a location (read-only: list and read, never write) and identifies each one by content: every `pg_dump` format — custom (`-Fc`, including gzip/lz4/zstd compression inside), tar (`-Ft`), directory (`-Fd`, a folder holding `toc.dat`, treated as one backup) — and plain SQL from `pg_dump`/`pg_dumpall`; `mysqldump` and `mariadb-dump` output (with or without comments, extended or one-row inserts, single or `--databases`); `mongodump --archive=<file>.archive` output (also with `--gzip`, which compresses the whole archive); whole files may also be gzip/zstd/lz4 compressed. Tarballs that aren't pg_dump archives are skipped.
@@ -79,6 +79,7 @@ Releases are cut by pushing a `v*` tag (`.github/workflows/release.yml`); runnin
 xinproof verify [flags] <location>
 xinproof receipt verify [--pubkey K] <receipt.json>...
 xinproof key
+xinproof agent
 xinproof version
 ```
 
@@ -136,6 +137,10 @@ xinproof verify \
 - The sandbox is thrown away afterwards, so a check can't harm anything; it runs within the backup's `--timeout`.
 
 Interrupting a run (Ctrl-C, SIGTERM) stops the current restore, removes its sandbox, and reports every backup not yet tested as ERROR, each with a receipt.
+
+### Running on a schedule
+- **Your own scheduler:** run `xinproof verify` from cron, CI or a container. A failing backup fails the job (see [Exit codes](#exit-codes)). [deploy/](deploy/README.md) has a GitHub Actions template and keyless, read-only setups for AWS, Azure, Google Cloud and R2.
+- **`xinproof agent`:** runs as a runner for Xinproof Cloud. It connects out over HTTPS (nothing connects in), takes the backup locations to test, runs `verify` on this machine, and sends back only the signed receipts. Start it with `XINPROOF_URL` and `XINPROOF_RUNNER_TOKEN`; `xinproof agent -h` lists its flags.
 
 ### Exit codes
 `0` all PASS · `1` any FAIL · `2` any ERROR and no FAIL (including "no backups found") · `3` usage error. A FAIL outranks an ERROR, so CI fails on a broken backup even if another couldn't be tested.
