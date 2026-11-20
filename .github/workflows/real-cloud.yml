@@ -39,6 +39,16 @@ jobs:
           go-version-file: go.mod
       - name: Build
         run: go build -o xinproof ./cmd/xinproof
+      # Optional: sign with a stable key so Xinproof Cloud can pin it.
+      - name: Signing key
+        env:
+          XINPROOF_KEY: ${{ secrets.XINPROOF_KEY }}
+        run: |
+          if [ -n "$XINPROOF_KEY" ]; then
+            mkdir -p ~/.xinproof/keys
+            printf '%s\n' "$XINPROOF_KEY" > ~/.xinproof/keys/ed25519.key
+            chmod 600 ~/.xinproof/keys/ed25519.key
+          fi
       - name: Pull sandbox images
         run: docker pull -q postgres:16 && docker pull -q mysql:8.0
 
@@ -49,7 +59,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: bash scripts/real-cloud.sh "${{ vars.AWS_TEST_LOCATION }}"
+        run: XINPROOF_RECEIPTS=receipts/aws bash scripts/real-cloud.sh "${{ vars.AWS_TEST_LOCATION }}"
 
       - name: Azure sign-in (GitHub OIDC, no stored secret)
         id: azlogin
@@ -61,7 +71,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Azure Blob (Storage Blob Data Reader, via the az login above)
         if: ${{ !cancelled() && steps.azlogin.outcome == 'success' }}
-        run: bash scripts/real-cloud.sh "${{ vars.AZURE_TEST_LOCATION }}"
+        run: XINPROOF_RECEIPTS=receipts/azure bash scripts/real-cloud.sh "${{ vars.AZURE_TEST_LOCATION }}"
 
       - name: Google Cloud sign-in (workload identity federation, no stored secret)
         id: gcplogin
@@ -72,17 +82,30 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
       - name: Google Cloud Storage (objectViewer on one bucket, via the sign-in above)
         if: ${{ !cancelled() && steps.gcplogin.outcome == 'success' }}
-        run: bash scripts/real-cloud.sh "${{ vars.GCP_TEST_LOCATION }}"
+        run: XINPROOF_RECEIPTS=receipts/gcp bash scripts/real-cloud.sh "${{ vars.GCP_TEST_LOCATION }}"
 
       - name: Cloudflare R2 (read-only token, one bucket)
         if: ${{ !cancelled() && env.HAS_R2 == 'true' }}
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: bash scripts/real-cloud.sh "${{ vars.R2_TEST_LOCATION }}" --r2-account-id "${{ vars.R2_ACCOUNT_ID }}"
+        run: XINPROOF_RECEIPTS=receipts/r2 bash scripts/real-cloud.sh "${{ vars.R2_TEST_LOCATION }}" --r2-account-id "${{ vars.R2_ACCOUNT_ID }}"
 
       - name: Clouds skipped (missing secrets or variables)
         if: ${{ !cancelled() && (env.HAS_AWS != 'true' || env.HAS_AZURE != 'true' || env.HAS_GCP != 'true' || env.HAS_R2 != 'true') }}
         run: |
           echo "AWS: $HAS_AWS  Azure: $HAS_AZURE  GCP: $HAS_GCP  R2: $HAS_R2"
           echo "::notice::Some real-cloud checks were skipped because their secrets or variables aren't set."
+
+      # Send the signed results to Xinproof Cloud, exactly as a customer's nightly job does.
+      - name: Send results to Xinproof Cloud
+        if: ${{ !cancelled() && vars.XINPROOF_CLOUD_URL != '' }}
+        env:
+          TOKEN: ${{ secrets.XINPROOF_CLOUD_TOKEN }}
+        run: |
+          n=0
+          for f in receipts/*/receipt-*.json; do
+            [ -e "$f" ] || continue
+            curl -fsS -X POST "${{ vars.XINPROOF_CLOUD_URL }}/api/v1/receipts" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data-binary @"$f" >/dev/null && n=$((n+1))
+          done
+          echo "::notice::Sent $n signed results to Xinproof Cloud"
