@@ -160,4 +160,6 @@ bash scripts/demo.sh                       # one good + one truncated dump, end 
 CI (`.github/workflows/ci.yml`) runs a `go mod tidy` drift check, cross-builds, vet, gofmt, race-enabled unit tests, the storage conformance suite against emulators (SeaweedFS for S3, Azurite, fake-gcs-server), restores against every supported PostgreSQL (13–18), MySQL (8.0, 8.4) and MariaDB (10.11, 11.4), the chaos tests, the demo, the JSON/JUnit report checks and govulncheck on every push.
 
 ## License
-[Apache-2.0](LICENSE)
+[FSL-1.1-ALv2](LICENSE) (Functional Source License, source-available). Free to use and modify, including at work. You can't use it to build a competing product or service. Each release becomes Apache-2.0 two years after it is published.
+
+Releases up to and including v0.2.0 were published under Apache-2.0 and stay under it.
